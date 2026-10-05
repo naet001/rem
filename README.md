@@ -76,7 +76,7 @@ Full reference — type `/` for the floating menu, `Up`/`Down` to move, `Tab` to
 | Command | Does |
 |---|---|
 | `/quit` | quit (same as `Ctrl+D` on empty input) |
-| `/clear` | clear transcript |
+| `/new` | start a new session (saves current, resets context, clears screen) |
 | `/help` | list commands |
 | `/theme [name]` | list themes, or switch live (`/theme gruvbox` narrows, `Tab` completes, active marked `●`) |
 | `/init` | model inspects the repo and writes project-root `AGENTS.md` via the normal write/approval flow |

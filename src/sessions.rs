@@ -46,6 +46,20 @@ fn gen_id(now: i64) -> String {
 }
 
 pub fn db_path() -> Result<PathBuf, String> {
+    // Test / hermetic override: when REM_SESSIONS_DB is set (tests, hermetic
+    // runs), use it directly instead of the platform data dir.
+    if let Ok(p) = std::env::var("REM_SESSIONS_DB")
+        && !p.trim().is_empty()
+    {
+        let path = PathBuf::from(p);
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        return Ok(path);
+    }
     let data_dir = dirs::data_dir().ok_or("could not determine platform data directory")?;
     let path = data_dir.join("rem").join("sessions.db");
     if let Some(parent) = path.parent() {

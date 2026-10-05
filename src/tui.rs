@@ -316,9 +316,9 @@ static COMMANDS: &[Command] = &[
         hint: "",
     },
     Command {
-        name: "clear",
+        name: "new",
         takes_arg: false,
-        desc: "clear transcript",
+        desc: "start a new session (clears context + screen)",
         hint: "",
     },
     Command {
@@ -1163,7 +1163,7 @@ struct App {
     approval_comment_open: bool,
     /// Ctrl+E risk help on/off.
     approval_explain: bool,
-    /// `/clear` flag: wipe screen + scrollback before the next drain.
+    /// `/new` flag: wipe screen + scrollback before the next drain.
     request_clear_screen: bool,
     /// In-flight turn worker + live-feed watcher (Task 1 / ADR-0006).
     /// D1: `tokio::spawn` tasks are independent — aborting the outer chat
@@ -1335,7 +1335,7 @@ impl App {
             skip_drain_once: false,
         };
         app.enqueue_notice(
-            "rem — esc interrupt · ^D quit when empty · ^C clear · /quit quit · /clear clears."
+            "rem — esc interrupt · ^D quit when empty · ^C clear · /quit quit · /new new session."
                 .to_string(),
         );
         app
@@ -1667,7 +1667,7 @@ fn event_loop(
 /// Print every queued transcript group above the bottom-anchored viewport.
 /// Each group is one `history::` row block; `insert_before` scrolls it
 /// into real scrollback. No-op when the queue is empty. A pending
-/// `/clear` wipes the screen + scrollback first (like Aster's `clear_all`).
+/// `/new` wipes the screen + scrollback first (like Aster's `clear_all`).
 fn drain_print_queue(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -1680,6 +1680,23 @@ fn drain_print_queue(
     }
     if app.request_clear_screen {
         app.request_clear_screen = false;
+        // Full TUI reset for `/new`: wipe visible screen *and* scrollback
+        // (like launch Clear All+Purge), so the old session transcript is
+        // gone — not just the viewport. `terminal.clear()` alone only
+        // clears the inline viewport and leaves scrollback behind.
+        // Re-anchor to the bottom first so the inline viewport stays
+        // where `resize_pane_viewport` expects it.
+        if let Ok((_, h)) = crossterm::terminal::size() {
+            let w = terminal.size().map(|s| s.width).unwrap_or(80);
+            let pane_h = viewport_height(app, w, h);
+            use crossterm::{cursor::MoveTo, execute};
+            let _ = execute!(
+                io::stdout(),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
+                MoveTo(0, h.saturating_sub(pane_h)),
+            );
+        }
         terminal.clear().context("clear screen")?;
     }
     for rows in app.print_queue.drain(..) {
@@ -2282,7 +2299,7 @@ fn submit(
         }
     }
     // Prefix-run (ADR-0007): a menu-eligible prefix resolves to the
-    // highlighted match before dispatch, so `/c` + Enter runs `/clear`.
+    // highlighted match before dispatch, so `/n` + Enter runs `/new`.
     if !menu_matches(&text).is_empty() {
         let matches = menu_matches(&text);
         let idx = app.menu_sel.unwrap_or(0).min(matches.len() - 1);
@@ -2300,9 +2317,48 @@ fn submit(
     if let Some((cmd, arg)) = parse_command(&text) {
         match cmd.name {
             "quit" => return true,
-            "clear" => {
-                app.request_clear_screen = true;
-                app.enqueue_notice("cleared.".to_string());
+            "new" => {
+                // Save current work first so nothing is lost.
+                if let Ok(conn) = crate::sessions::open()
+                    && let Ok(msgs) = agent.export_sync()
+                {
+                    let _ = crate::sessions::save_messages(&conn, &app.session_id, &msgs);
+                    let _ = crate::sessions::touch(&conn, &app.session_id);
+                }
+                // Fresh agent context.
+                if let Err(e) = agent.import_sync("[]") {
+                    app.enqueue_notice(format!("new failed: {e}"));
+                    return false;
+                }
+                // Fresh session row.
+                match crate::sessions::open() {
+                    Err(e) => app.enqueue_notice(format!("new failed: {e}")),
+                    Ok(conn) => match crate::sessions::create_session(
+                        &conn,
+                        &picker_project_root(),
+                        &agent.model_name(),
+                    ) {
+                        Err(e) => app.enqueue_notice(format!("new failed: {e}")),
+                        Ok(ns) => {
+                            app.session_id = ns.id.clone();
+                            app.session_title = "untitled".to_string();
+                            let _ = crate::sessions::update_title(&conn, &ns.id, "untitled");
+                            // Full TUI reset: drop any queued transcript rows so
+                            // nothing from the old session drains after the
+                            // screen wipe. Only the notice below survives.
+                            app.print_queue.clear();
+                            app.streamed_tools = 0;
+                            app.session_picker = None;
+                            app.pending_approvals.clear();
+                            app.approval_sel = 0;
+                            app.approval_comment.clear();
+                            app.approval_comment_open = false;
+                            app.approval_explain = false;
+                            app.request_clear_screen = true;
+                            app.enqueue_notice("new session.".to_string());
+                        }
+                    },
+                }
                 return false;
             }
             "help" => {
@@ -4721,13 +4777,82 @@ mod tests {
         assert!(app.busy);
     }
 
+    static SESSION_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Stub agent with working context export/import for `/new` tests.
+    /// Records every `import_sync` payload so tests can assert the
+    /// context was reset to `[]`.
+    struct NewStubAgent {
+        imported: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl NewStubAgent {
+        fn new() -> Self {
+            Self {
+                imported: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentLoop for NewStubAgent {
+        async fn chat(&self, _prompt: &str) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn export_sync(&self) -> Result<String, String> {
+            Ok("[{\"old\":true}]".to_string())
+        }
+        fn import_sync(&self, json: &str) -> Result<(), String> {
+            self.imported.lock().unwrap().push(json.to_string());
+            Ok(())
+        }
+    }
+
+    /// Point `sessions::open()` at a throwaway SQLite file. Returns the
+    /// serial guard, the path, and the previous env value so the caller
+    /// can restore + delete the file.
+    fn temp_session_db() -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::path::PathBuf,
+        Option<String>,
+    ) {
+        let guard = SESSION_DB_LOCK.lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "rem-new-test-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let prev = std::env::var("REM_SESSIONS_DB").ok();
+        // SAFETY: guarded by SESSION_DB_LOCK; tests are the only writers.
+        unsafe {
+            std::env::set_var("REM_SESSIONS_DB", &path);
+        }
+        (guard, path, prev)
+    }
+
+    fn restore_session_db(path: &std::path::Path, prev: Option<String>) {
+        // SAFETY: guarded by SESSION_DB_LOCK; tests are the only writers.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("REM_SESSIONS_DB", v),
+                None => std::env::remove_var("REM_SESSIONS_DB"),
+            }
+        }
+        std::fs::remove_file(path).ok();
+    }
+
     #[test]
-    fn slash_clear_requests_screen_wipe_and_notice() {
+    fn slash_new_resets_context_and_wipes_screen() {
+        let (_guard, db_path, prev) = temp_session_db();
         let mut app = App::new("model".to_string(), "medium".to_string());
+        let old_id = app.session_id.clone();
         app.print_queue.clear();
-        app.input = "/clear".to_string();
-        app.cursor = 6;
-        let agent = std::sync::Arc::new(StubAgent);
+        app.input = "/new".to_string();
+        app.cursor = 4;
+        let agent = std::sync::Arc::new(NewStubAgent::new());
         let (tx, _rx) = mpsc::channel::<TurnResult>();
         let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
         assert!(!handle_key(
@@ -4739,6 +4864,13 @@ mod tests {
             KeyModifiers::empty()
         ));
         assert!(app.request_clear_screen);
+        assert_eq!(app.session_title, "untitled");
+        assert!(!app.session_id.is_empty());
+        assert_ne!(app.session_id, old_id);
+        assert_eq!(
+            agent.imported.lock().unwrap().as_slice(),
+            ["[]".to_string()].as_slice()
+        );
         let flat: String = app
             .print_queue
             .iter()
@@ -4751,7 +4883,39 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(flat.contains("cleared."), "got: {flat}");
+        assert!(flat.contains("new session."), "got: {flat}");
+        // The fresh session row landed in the temp DB.
+        let conn = crate::sessions::open().expect("temp db opens");
+        let row = crate::sessions::get_session(&conn, &app.session_id).expect("get_session works");
+        assert!(row.is_some(), "new session row missing");
+        restore_session_db(&db_path, prev);
+    }
+
+    #[test]
+    fn slash_new_busy_ignored_like_other_commands() {
+        // `submit` early-returns on `busy` before dispatch, so `/new`
+        // while busy is silently ignored like every other command.
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.busy = true;
+        app.print_queue.clear();
+        app.input = "/new".to_string();
+        app.cursor = 4;
+        let old_id = app.session_id.clone();
+        let agent = std::sync::Arc::new(NewStubAgent::new());
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.request_clear_screen);
+        assert!(agent.imported.lock().unwrap().is_empty());
+        assert_eq!(app.session_id, old_id);
+        assert!(app.busy, "busy turn must keep running");
     }
 
     #[test]
@@ -4800,14 +4964,15 @@ mod tests {
                 .map(|c| c.name)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names("/c"), vec!["clear"]);
+        assert_eq!(names("/n"), vec!["new"]);
         assert_eq!(names("/qu"), vec!["quit"]);
         assert_eq!(names("/h"), vec!["help"]);
+        assert!(menu_matches("/c").is_empty());
         assert!(menu_matches("/C").is_empty());
-        assert!(menu_matches("/CLEAR").is_empty());
+        assert!(menu_matches("/NEW").is_empty());
         assert!(menu_matches("/ ").is_empty());
         assert!(menu_matches("/foo bar").is_empty());
-        assert!(menu_matches("/clear ").is_empty());
+        assert!(menu_matches("/new ").is_empty());
         assert!(menu_matches("/bogus").is_empty());
     }
 
@@ -4831,16 +4996,20 @@ mod tests {
     fn slash_menu_clamp_reconciles_selection_after_edits() {
         let mut app = App::new("model".to_string(), "medium".to_string());
         app.input = "/".to_string();
+        app.cursor = 1;
         clamp_menu_sel(&mut app);
         assert_eq!(app.menu_sel, Some(0));
-        app.input = "/c".to_string();
+        app.input = "/n".to_string();
+        app.cursor = 2;
         app.menu_sel = Some(2);
         clamp_menu_sel(&mut app);
         assert_eq!(app.menu_sel, Some(0));
         app.input = "hello".to_string();
+        app.cursor = 5;
         clamp_menu_sel(&mut app);
         assert_eq!(app.menu_sel, None);
         app.input = "/foo bar".to_string();
+        app.cursor = 8;
         app.menu_sel = Some(0);
         clamp_menu_sel(&mut app);
         assert_eq!(app.menu_sel, None);
@@ -4856,7 +5025,7 @@ mod tests {
         app.cursor = 1;
         app.menu_sel = Some(0);
         app.history = vec!["old turn".to_string()];
-        // 9 registry commands: quit, clear, help, theme, init, resume,
+        // 9 registry commands: quit, new, help, theme, init, resume,
         // rename, fork, skills.
         for expect in [1, 2, 3, 4, 5, 6, 7, 8, 0] {
             assert!(!handle_key(
@@ -5144,7 +5313,7 @@ mod tests {
         let agent = std::sync::Arc::new(StubAgent);
         let (tx, _rx) = mpsc::channel::<TurnResult>();
         let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
-        app.input = "/c".to_string();
+        app.input = "/n".to_string();
         app.cursor = 2;
         app.menu_sel = Some(0);
         assert!(!handle_key(
@@ -5155,8 +5324,8 @@ mod tests {
             KeyCode::Tab,
             KeyModifiers::empty()
         ));
-        assert_eq!(app.input, "/clear");
-        assert_eq!(app.cursor, 6);
+        assert_eq!(app.input, "/new");
+        assert_eq!(app.cursor, 4);
         assert!(is_menu_open(&app));
         assert_eq!(app.menu_sel, Some(0));
     }
@@ -5250,7 +5419,7 @@ mod tests {
         let agent = std::sync::Arc::new(StubAgent);
         let (tx, _rx) = mpsc::channel::<TurnResult>();
         let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
-        app.input = "/c".to_string();
+        app.input = "/h".to_string();
         app.cursor = 2;
         app.menu_sel = Some(0);
         assert!(!handle_key(
@@ -5262,7 +5431,7 @@ mod tests {
             KeyModifiers::empty()
         ));
         assert_eq!(app.menu_sel, None);
-        assert_eq!(app.history.last().map(String::as_str), Some("/clear"));
+        assert_eq!(app.history.last().map(String::as_str), Some("/help"));
         let flat: String = app
             .print_queue
             .iter()
@@ -5275,7 +5444,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(flat.contains("cleared."), "got: {flat}");
+        assert!(flat.contains("commands:"), "got: {flat}");
     }
 
     #[test]
@@ -5326,7 +5495,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        for name in ["/quit", "/clear", "/help", "/theme", "/init", "/skills"] {
+        for name in ["/quit", "/new", "/help", "/theme", "/init", "/skills"] {
             assert!(flat.contains(name), "help missing {name}: {flat}");
         }
         assert!(flat.contains("quit the app"), "help missing desc: {flat}");
@@ -5377,11 +5546,11 @@ mod tests {
         terminal.draw(|f| render_pane(f, &mut app)).unwrap();
         let text = terminal.backend().to_string();
         // Float box renders over the pane. All commands visible.
-        for name in ["/quit", "/clear"] {
+        for name in ["/quit", "/new"] {
             assert!(text.contains(name), "menu row missing {name}: {text}");
         }
         assert!(
-            text.contains("clear transcript"),
+            text.contains("start a new session"),
             "menu desc missing: {text}"
         );
         assert!(text.contains('▸'), "selection marker missing: {text}");
@@ -5551,7 +5720,7 @@ mod tests {
         assert_eq!(theme_arg_partial("/theme"), None);
         assert_eq!(theme_arg_partial("/the"), None);
         // Other commands never trigger arg mode.
-        assert_eq!(theme_arg_partial("/clear "), None);
+        assert_eq!(theme_arg_partial("/new "), None);
         assert_eq!(theme_arg_partial("/ "), None);
         // Multi-token args dispatch directly, no suggestions.
         assert_eq!(theme_arg_partial("/theme a b"), None);

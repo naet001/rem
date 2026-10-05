@@ -66,9 +66,10 @@ mod tests {
         // Regression: models emit `{"offset": 120.0}` for `"type": "number"`
         // schemas, which failed with
         // `invalid type: floating point 120.0, expected usize`.
-        let args: ReadArgs =
-            serde_json::from_value(serde_json::json!({"path": "x", "offset": 120.0, "limit": 50.0}))
-                .expect("float 120.0 should parse as usize 120");
+        let args: ReadArgs = serde_json::from_value(
+            serde_json::json!({"path": "x", "offset": 120.0, "limit": 50.0}),
+        )
+        .expect("float 120.0 should parse as usize 120");
         assert_eq!(args.offset, Some(120));
         assert_eq!(args.limit, Some(50));
     }
