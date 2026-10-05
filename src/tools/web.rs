@@ -35,6 +35,7 @@ fn check_url(url: &str) -> Result<(), ToolError> {
 #[derive(Debug, Deserialize)]
 pub struct WebFetchArgs {
     pub url: String,
+    #[serde(default, deserialize_with = "super::opt_usize_lenient")]
     pub max_bytes: Option<usize>,
 }
 
@@ -56,7 +57,7 @@ impl Tool for WebFetchTool {
             "type": "object",
             "properties": {
                 "url": { "type": "string", "description": "Full http(s) URL to fetch" },
-                "max_bytes": { "type": "number", "description": "Max bytes of text to return. Omit for 8000." }
+                "max_bytes": { "type": "integer", "description": "Max bytes of text to return. Omit for 8000." }
             },
             "required": ["url"]
         })
@@ -226,6 +227,7 @@ fn html_to_text(html: &str) -> String {
 #[derive(Debug, Deserialize)]
 pub struct WebSearchArgs {
     pub query: String,
+    #[serde(default, deserialize_with = "super::opt_u8_lenient")]
     pub count: Option<u8>,
 }
 
@@ -249,7 +251,7 @@ impl Tool for WebSearchTool {
             "type": "object",
             "properties": {
                 "query": { "type": "string", "description": "Search query" },
-                "count": { "type": "number", "description": "Max results to return (default 5, max 10)" }
+                "count": { "type": "integer", "description": "Max results to return (default 5, max 10)" }
             },
             "required": ["query"]
         })

@@ -7,7 +7,9 @@ use super::ToolError;
 #[derive(Debug, Deserialize)]
 pub struct ReadArgs {
     pub path: String,
+    #[serde(default, deserialize_with = "super::opt_usize_lenient")]
     pub offset: Option<usize>,
+    #[serde(default, deserialize_with = "super::opt_usize_lenient")]
     pub limit: Option<usize>,
 }
 
@@ -29,8 +31,8 @@ impl Tool for ReadTool {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path to the file to read" },
-                "offset": { "type": "number", "description": "First line to return (0-based). Omit for start of file." },
-                "limit": { "type": "number", "description": "Max lines to return. Omit for the whole file." }
+                "offset": { "type": "integer", "description": "First line to return (0-based). Omit for start of file." },
+                "limit": { "type": "integer", "description": "Max lines to return. Omit for the whole file." }
             },
             "required": ["path"]
         })
@@ -52,5 +54,35 @@ impl Tool for ReadTool {
                 Ok(lines[start..end].join("\n"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_float_offsets_like_120_dot_0() {
+        // Regression: models emit `{"offset": 120.0}` for `"type": "number"`
+        // schemas, which failed with
+        // `invalid type: floating point 120.0, expected usize`.
+        let args: ReadArgs =
+            serde_json::from_value(serde_json::json!({"path": "x", "offset": 120.0, "limit": 50.0}))
+                .expect("float 120.0 should parse as usize 120");
+        assert_eq!(args.offset, Some(120));
+        assert_eq!(args.limit, Some(50));
+    }
+
+    #[test]
+    fn parses_ints_and_missing_fields() {
+        let args: ReadArgs =
+            serde_json::from_value(serde_json::json!({"path": "x", "offset": 5, "limit": 10}))
+                .unwrap();
+        assert_eq!(args.offset, Some(5));
+        assert_eq!(args.limit, Some(10));
+
+        let args: ReadArgs = serde_json::from_value(serde_json::json!({"path": "x"})).unwrap();
+        assert_eq!(args.offset, None);
+        assert_eq!(args.limit, None);
     }
 }
