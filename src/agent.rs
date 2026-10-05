@@ -69,6 +69,28 @@ pub trait AgentLoop {
     fn reload_skills_sync(&self) -> Result<String, String> {
         Err("not supported".to_string())
     }
+    /// Connected MCP servers for the `/mcp` panel. Default: none.
+    /// `RigAgent` reports live status + counts + session enable flags.
+    fn list_mcp_servers(&self) -> Vec<McpServerSummary> {
+        Vec::new()
+    }
+    /// Enable/disable one MCP server for the session scope. Takes effect
+    /// immediately (tools unregister/re-register on the shared handle).
+    /// Default: unsupported (alternate impls without MCP).
+    fn set_mcp_server_enabled(&self, _name: &str, _enabled: bool) -> Result<String, String> {
+        Err("not supported".to_string())
+    }
+    /// Begin OAuth login for one MCP server. Returns the authorization
+    /// URL to open (caller prints it + tries the system browser).
+    /// Default: unsupported (alternate impls without MCP).
+    fn mcp_login(&self, _name: &str) -> Result<String, String> {
+        Err("not supported".to_string())
+    }
+    /// Log out of one MCP server: clear the stored token, drop the
+    /// connection, mark needs-auth. Default: unsupported.
+    fn mcp_logout(&self, _name: &str) -> Result<String, String> {
+        Err("not supported".to_string())
+    }
     // Trait surface for alternate `AgentLoop` impls; `RigAgent` overrides it.
     #[allow(dead_code)]
     async fn export_messages_json(&self) -> Result<String, String> {
@@ -83,6 +105,28 @@ pub trait AgentLoop {
     fn import_sync(&self, _json: &str) -> Result<(), String> {
         Err("not supported".to_string())
     }
+}
+
+/// One MCP server for the `/mcp` panel: identity + connection status +
+/// tool count + session enable flag. No handles across the trait — the
+/// TUI renders text; toggling goes through trait methods.
+#[derive(Debug, Clone)]
+pub struct McpServerSummary {
+    pub name: String,
+    pub status: McpServerStatus,
+    pub tool_count: usize,
+    pub enabled: bool,
+}
+
+/// Connection status for one MCP server in the `/mcp` panel.
+#[derive(Debug, Clone)]
+pub enum McpServerStatus {
+    /// Spawned/connected and tools registered.
+    Connected,
+    /// Spawn/connect/list failed; carries the warn-and-continue reason.
+    Failed { reason: String },
+    /// HTTP 401 path (Ticket 06): needs `/mcp login <name>`.
+    NeedsAuth,
 }
 
 /// One discovered skill for the `/skills` list: identity + listing fields only.
@@ -253,6 +297,37 @@ pub struct RigAgent {
     project_root: std::path::PathBuf,
     gate: PermissionHook,
     skills: Arc<Mutex<Vec<crate::skills::Skill>>>,
+    // Shared tool registry: 11 built-ins + runtime-added MCP tools.
+    // Held here (not rebuilt) so `/skills reload` and preamble rebuilds
+    // never drop MCP registrations.
+    tool_handle: rig::agent::tool::server::ToolServerHandle,
+    // Rendered MCP preamble index, remembered so `/skills reload`
+    // preserves it. Ticket 05 recomputes it on `/mcp` toggles.
+    // Interior mutability: main connects MCP after construction.
+    mcp_section: std::sync::Mutex<String>,
+    // Live MCP records: one per configured server. Shared with each
+    // `RefreshHandler` so `list_changed` refresh skips disabled
+    // servers; connections live here for the process lifetime.
+    mcp_state: crate::mcp::SharedMcpState,
+}
+
+/// Build the shared tool registry: all 11 static built-ins on one
+/// `ToolServerHandle` so later MCP tools can join the same registry.
+fn build_tool_server() -> rig::agent::tool::server::ToolServerHandle {
+    use rig::agent::tool::server::ToolServer;
+    ToolServer::new()
+        .tool(ReadTool)
+        .tool(WriteTool)
+        .tool(EditTool)
+        .tool(BashTool)
+        .tool(ListDirectoryTool)
+        .tool(GitStatusTool)
+        .tool(GitDiffTool)
+        .tool(GrepTool)
+        .tool(GlobTool)
+        .tool(WebFetchTool)
+        .tool(WebSearchTool)
+        .run()
 }
 
 /// Project instructions file name, loaded from the project root only.
@@ -266,19 +341,71 @@ fn load_agents_md(project_root: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(project_root.join(AGENTS_MD)).ok()
 }
 
+/// Compose the agent preamble: static instructions + project context +
+/// skills index + MCP index. Pure constructor — called at startup and on
+/// `/skills reload`. `mcp_section` is pre-rendered by the MCP module
+/// (empty when no servers); Ticket 05 refreshes it on `/mcp` toggles.
+fn build_preamble(
+    project_root: &std::path::Path,
+    skills: &[crate::skills::Skill],
+    mcp_section: &str,
+) -> String {
+    let mut preamble = String::from(
+        "You are rem, a coding agent in a terminal TUI. \
+         Use the read/write/edit/bash/list_directory/git_status/git_diff/grep/glob/web_fetch/web_search tools to inspect and change files. \
+         list_directory lists a dir, glob finds files by pattern, grep searches contents, git_status/git_diff inspect git state. \
+         web_search searches the web (DuckDuckGo, no key), web_fetch reads a URL as text. \
+         Bash runs `sh -c` in the project dir (30s timeout). Destructive shell patterns are blocked outright; other mutations and network access ask the human for approval mid-run — if a call is denied, replan without it. \
+         Prefer reading a file before editing it. Keep replies concise.",
+    );
+    if let Some(body) = load_agents_md(project_root) {
+        preamble.push_str(AGENTS_MD_HEADER);
+        preamble.push_str(&body);
+    }
+    if !skills.is_empty() {
+        preamble.push_str(&crate::skills::preamble_section(skills));
+    }
+    preamble.push_str(mcp_section);
+    preamble
+}
+
 impl RigAgent {
     pub fn new(
         cfg: &Config,
         approval_tx: ApprovalTx,
         project_root: std::path::PathBuf,
     ) -> Result<Self, String> {
+        Self::new_with_mcp_section(cfg, approval_tx, project_root, "")
+    }
+
+    /// Constructor with a pre-rendered MCP preamble index. The caller
+    /// (`main`) connects MCP servers first, then passes the section so
+    /// the frozen preamble advertises connected tools from turn one.
+    /// `/skills reload` rebuilds with the same section; Ticket 05
+    /// refreshes it on `/mcp` toggles.
+    pub fn new_with_mcp_section(
+        cfg: &Config,
+        approval_tx: ApprovalTx,
+        project_root: std::path::PathBuf,
+        mcp_section: &str,
+    ) -> Result<Self, String> {
         let recorder = ToolRecorder::default();
         let mode = Arc::new(Mutex::new(Mode::default()));
         // Observer first (see everything), gate second (steers). ADR-0001.
         let gate = PermissionHook::new(approval_tx, project_root.clone(), mode.clone());
         let skills = crate::skills::discover(&project_root);
+        let tool_handle = build_tool_server();
+        let mcp_state: crate::mcp::SharedMcpState = Default::default();
 
-        let agent = Self::build_inner(cfg, &gate, &recorder, &project_root, &skills)?;
+        let agent = Self::build_inner(
+            cfg,
+            &gate,
+            &recorder,
+            &project_root,
+            &skills,
+            &tool_handle,
+            mcp_section,
+        )?;
 
         Ok(Self {
             inner: tokio::sync::RwLock::new(agent),
@@ -291,7 +418,21 @@ impl RigAgent {
             project_root,
             gate,
             skills: Arc::new(Mutex::new(skills)),
+            tool_handle,
+            mcp_section: std::sync::Mutex::new(mcp_section.to_string()),
+            mcp_state,
         })
+    }
+
+    /// Shared live MCP records for `/mcp` + refresh handlers.
+    pub fn mcp_state(&self) -> &crate::mcp::SharedMcpState {
+        &self.mcp_state
+    }
+
+    /// The shared tool registry (built-ins + MCP tools). Ticket 03's
+    /// `connect_all` registers onto this; preamble rebuilds reuse it.
+    pub fn tool_server_handle(&self) -> rig::agent::tool::server::ToolServerHandle {
+        self.tool_handle.clone()
     }
 
     /// Build the inner `rig::agent::Agent`: client + preamble (static +
@@ -303,6 +444,8 @@ impl RigAgent {
         recorder: &ToolRecorder,
         project_root: &std::path::Path,
         skills: &[crate::skills::Skill],
+        tool_handle: &rig::agent::tool::server::ToolServerHandle,
+        mcp_section: &str,
     ) -> Result<rig::agent::Agent, String> {
         // Explicit `.base_url()` per spec — no reliance on OPENAI_BASE_URL env.
         let client = openai::CompletionsClient::builder()
@@ -313,38 +456,11 @@ impl RigAgent {
 
         let model = client.completion_model(cfg.model.default.clone());
 
-        let mut preamble = String::from(
-            "You are rem, a coding agent in a terminal TUI. \
-             Use the read/write/edit/bash/list_directory/git_status/git_diff/grep/glob/web_fetch/web_search tools to inspect and change files. \
-             list_directory lists a dir, glob finds files by pattern, grep searches contents, git_status/git_diff inspect git state. \
-             web_search searches the web (DuckDuckGo, no key), web_fetch reads a URL as text. \
-             Bash runs `sh -c` in the project dir (30s timeout). Destructive shell patterns are blocked outright; other mutations and network access ask the human for approval mid-run — if a call is denied, replan without it. \
-             Prefer reading a file before editing it. Keep replies concise.",
-        );
-        // Project context (ADR-0009): project-root AGENTS.md only, appended
-        // after static instructions, silently skipped when missing.
-        if let Some(body) = load_agents_md(project_root) {
-            preamble.push_str(AGENTS_MD_HEADER);
-            preamble.push_str(&body);
-        }
-        // Skills index: names+descriptions+paths at startup, bodies via `read`.
-        if !skills.is_empty() {
-            preamble.push_str(&crate::skills::preamble_section(skills));
-        }
+        let preamble = build_preamble(project_root, skills, mcp_section);
 
         let agent = AgentBuilder::new(model)
             .preamble(&preamble)
-            .tool(ReadTool)
-            .tool(WriteTool)
-            .tool(EditTool)
-            .tool(BashTool)
-            .tool(ListDirectoryTool)
-            .tool(GitStatusTool)
-            .tool(GitDiffTool)
-            .tool(GrepTool)
-            .tool(GlobTool)
-            .tool(WebFetchTool)
-            .tool(WebSearchTool)
+            .tool_server_handle(tool_handle.clone())
             .default_max_turns(100)
             .additional_params(serde_json::json!({"reasoning_effort": cfg.model.effort.clone()}))
             .add_hook(recorder.clone())
@@ -372,6 +488,65 @@ impl RigAgent {
             .await
             .map_err(|e| e.to_string())
             .map(|s| s.trim().to_string())
+    }
+
+    /// Rebuild the preamble index from the current enabled inventory.
+    /// Shared by toggle + logout + login-callback paths. Same shared
+    /// handle, so tools survive. Fail-closed on rebuild error.
+    fn rebuild_mcp_preamble(&self) -> Result<(), String> {
+        let section = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                crate::mcp::preamble_section(
+                    &crate::mcp::inventory_for_enabled(&self.mcp_state, &self.tool_handle).await,
+                )
+            })
+        });
+        let fresh = crate::skills::discover(&self.project_root);
+        let rebuilt = Self::build_inner(
+            &self.cfg,
+            &self.gate,
+            &self.recorder,
+            &self.project_root,
+            &fresh,
+            &self.tool_handle,
+            &section,
+        )?;
+        match self.inner.try_write() {
+            Ok(mut guard) => {
+                *guard = rebuilt;
+                if let Ok(mut s) = self.mcp_section.lock() {
+                    *s = section;
+                }
+            }
+            Err(_) => return Err("agent busy, try again".to_string()),
+        }
+        Ok(())
+    }
+
+    /// Rebuild the preamble with a fresh MCP index after startup
+    /// connects servers. Same shared handle, so tools survive.
+    /// Fail-closed: rebuild error keeps the old agent.
+    pub fn rebuild_preamble_with_mcp_section(&mut self, mcp_section: &str) -> Result<(), String> {
+        let fresh = self.skills.lock().map(|g| g.clone()).unwrap_or_default();
+        let rebuilt = Self::build_inner(
+            &self.cfg,
+            &self.gate,
+            &self.recorder,
+            &self.project_root,
+            &fresh,
+            &self.tool_handle,
+            mcp_section,
+        )?;
+        match self.inner.try_write() {
+            Ok(mut guard) => {
+                *guard = rebuilt;
+            }
+            Err(_) => return Err("agent busy, try again".to_string()),
+        }
+        if let Ok(mut guard) = self.mcp_section.lock() {
+            *guard = mcp_section.to_string();
+        }
+        Ok(())
     }
 }
 
@@ -509,18 +684,84 @@ impl AgentLoop for RigAgent {
             .find(|s| s.name == name)
             .map(|s| s.body.clone())
     }
+    fn list_mcp_servers(&self) -> Vec<McpServerSummary> {
+        // Sync TUI path into async handle reads: block in place (multi-
+        // thread main runtime) so `/mcp` never starts a turn.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(crate::mcp::mcp_server_summaries(
+                &self.mcp_state,
+                &self.tool_handle,
+            ))
+        })
+    }
+    fn mcp_login(&self, name: &str) -> Result<String, String> {
+        // Login is async (discovery + registration + browser wait
+        // happen in a spawned task): same block-in-place bridge as the
+        // toggle. Returns the auth URL; completion reconnects.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(crate::mcp::mcp_login(
+                &self.mcp_state,
+                &self.tool_handle,
+                name,
+                &crate::mcp::default_token_store(),
+            ))
+        })
+    }
+    fn mcp_logout(&self, name: &str) -> Result<String, String> {
+        // Logout is async (drop + tool removal): same bridge. Rebuilds
+        // the preamble index like the toggle path.
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(crate::mcp::mcp_logout(
+                &self.mcp_state,
+                &self.tool_handle,
+                name,
+                &crate::mcp::default_token_store(),
+            ))
+        });
+        if result.is_ok() {
+            self.rebuild_mcp_preamble()?;
+        }
+        result
+    }
+    fn set_mcp_server_enabled(&self, name: &str, enabled: bool) -> Result<String, String> {
+        // Toggle is async (reconnect does I/O): same block-in-place
+        // bridge as `list_mcp_servers`. Refused while busy by the caller.
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(crate::mcp::mcp_set_enabled(
+                &self.mcp_state,
+                &self.tool_handle,
+                name,
+                enabled,
+            ))
+        });
+        // Toggle changes the tool set: rebuild the preamble index so the
+        // Principal sees current tools. Fail-closed on rebuild error.
+        if result.is_ok() {
+            self.rebuild_mcp_preamble()?;
+        }
+        result
+    }
     /// Re-scan skill dirs + rebuild the inner `Agent` so subsequent turns see
     /// new/edited skills. History (`Context`), recorder, gate allows, and mode
     /// survive (same Arcs reused). Fail-closed: rebuild error keeps old agent.
     /// Caller (TUI) must refuse while a turn is in-flight (`app.busy`).
+    /// Reload preserves the MCP preamble index: reload is skills-only.
+    /// Ticket 05 recomputes the section on `/mcp` toggles.
     fn reload_skills_sync(&self) -> Result<String, String> {
         let fresh = crate::skills::discover(&self.project_root);
+        let section = self
+            .mcp_section
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         let rebuilt = Self::build_inner(
             &self.cfg,
             &self.gate,
             &self.recorder,
             &self.project_root,
             &fresh,
+            &self.tool_handle,
+            &section,
         )?;
         match self.inner.try_write() {
             Ok(mut guard) => {
@@ -547,6 +788,158 @@ impl AgentLoop for RigAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tool_server_registers_all_eleven_builtins() {
+        let handle = build_tool_server();
+        let mut names: Vec<String> = handle
+            .get_tool_defs(None)
+            .await
+            .expect("tool defs")
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "bash",
+                "edit",
+                "git_diff",
+                "git_status",
+                "glob",
+                "grep",
+                "list_directory",
+                "read",
+                "web_fetch",
+                "web_search",
+                "write",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn reload_skills_preserves_shared_handle_registrations() {
+        use rig::tool::DynamicTool;
+        let cfg = Config {
+            api: crate::config::ApiConfig {
+                key: "sk-test".to_string(),
+                base_url: "https://api.example.com/v1".to_string(),
+            },
+            model: crate::config::ModelConfig {
+                default: "gpt-4o".to_string(),
+                effort: "medium".to_string(),
+            },
+            theme: Default::default(),
+        };
+        let (tx, _rx) = crate::permissions::approval_channel();
+        let dir = std::env::temp_dir().join("rem-mcp-test-reload-xyz");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent = RigAgent::new(&cfg, tx, dir.clone()).expect("agent");
+        // Simulate an MCP registration landing on the shared handle.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(
+            agent
+                .tool_server_handle()
+                .add_dynamic_tool(DynamicTool::new(
+                    "mcp__py__echo_downcase",
+                    "MCP tool",
+                    serde_json::json!({"type": "object"}),
+                    |_ctx, _args| Box::pin(async move { Ok(rig::tool::ToolOutput::text("hi")) }),
+                )),
+        );
+        agent.reload_skills_sync().expect("reload");
+        let names = rt
+            .block_on(agent.tool_server_handle().get_tool_defs(None))
+            .expect("defs");
+        assert!(
+            names.iter().any(|d| d.name == "mcp__py__echo_downcase"),
+            "reload dropped MCP registration: {:?}",
+            names.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_preamble_appends_mcp_section_after_skills() {
+        let dir = std::env::temp_dir().join("rem-test-preamble-mcp-xyz");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = build_preamble(&dir, &[], "\n\nMCP tools:\n- mcp__py__echo\n");
+        assert!(text.contains("mcp__py__echo"), "got: {text}");
+        // Static instructions come first; MCP index rides at the end.
+        let static_pos = text.find("You are rem").expect("static preamble");
+        let mcp_pos = text.find("mcp__py__echo").unwrap();
+        assert!(static_pos < mcp_pos);
+        // Empty section adds nothing.
+        assert!(!build_preamble(&dir, &[], "").contains("MCP"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live bridge coverage: sync trait methods over the async MCP
+    /// state. Needs multi_thread (block_in_place panics on
+    /// current-thread). Production main is multi-thread.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_mcp_panel_bridge_lists_and_rejects_unknown() {
+        let cfg = Config {
+            api: crate::config::ApiConfig {
+                key: "sk-test".to_string(),
+                base_url: "https://api.example.com/v1".to_string(),
+            },
+            model: crate::config::ModelConfig {
+                default: "gpt-4o".to_string(),
+                effort: "medium".to_string(),
+            },
+            theme: Default::default(),
+        };
+        let (tx, _rx) = crate::permissions::approval_channel();
+        let dir = std::env::temp_dir().join("rem-mcp-test-panel-bridge-xyz");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent = RigAgent::new(&cfg, tx, dir.clone()).expect("agent");
+        // Empty state: panel lists nothing, toggle rejects unknown.
+        assert!(agent.list_mcp_servers().is_empty());
+        let err = agent
+            .set_mcp_server_enabled("nope", false)
+            .expect_err("unknown server");
+        assert!(err.contains("nope"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live bridge coverage: sync login/logout trait methods.
+    /// Needs multi_thread (block_in_place panics on current-thread).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_mcp_login_logout_bridge() {
+        let cfg = Config {
+            api: crate::config::ApiConfig {
+                key: "sk-test".to_string(),
+                base_url: "https://api.example.com/v1".to_string(),
+            },
+            model: crate::config::ModelConfig {
+                default: "gpt-4o".to_string(),
+                effort: "medium".to_string(),
+            },
+            theme: Default::default(),
+        };
+        let (tx, _rx) = crate::permissions::approval_channel();
+        let dir = std::env::temp_dir().join("rem-mcp-test-login-bridge-xyz");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent = RigAgent::new(&cfg, tx, dir.clone()).expect("agent");
+        // Unknown server: login + logout both error naming it.
+        let err = agent.mcp_login("nope").expect_err("unknown login");
+        assert!(err.contains("nope"), "got: {err}");
+        let err = agent.mcp_logout("nope").expect_err("unknown logout");
+        assert!(err.contains("nope"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn load_agents_md_returns_none_when_missing() {

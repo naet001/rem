@@ -21,12 +21,12 @@ Legend: `[ ]` todo, `[/]` in-progress branch, `[x]` done.
 - [ ] `--yolo` / `--plan` / `--mode <name>` flags for headless runs
 - [ ] `--resume <id>` works headless; fail-open policy flag (`--approve` / `--deny` default)
 
-### 3. MCP client (`feat/mcp` exists, not landed)
-- [ ] Land `feat/mcp`: MCP client (stdio + SSE/http)
-- [ ] MCP servers from config (`~/.config/rem/mcp.toml` or `[mcp]` section)
-- [ ] Discovered MCP tools flow through `PermissionHook::classify` (fail-closed `Confirm`)
-- [ ] `/mcp` command: list servers/tools, reconnect, auth status
-- [ ] MCP tools appear in preamble + `last_tool_events` tree
+### 3. MCP client (landed 2026-10-06, tickets 01-06 in `.scratch/mcp-client/issues/`)
+- [x] Land MCP client: stdio + streamable HTTP (legacy SSE out — rmcp 2.2 ships no SSE client dialect, per ADR-0013)
+- [x] MCP servers from `~/.config/rem/mcp.json` (Claude `mcpServers` shape, `${VAR}`/`${VAR:-default}` expansion; supersedes `mcp.toml` wording)
+- [x] Discovered MCP tools flow through `PermissionHook::classify` (explicit `mcp__*` Confirm arm; Yolo Allow, Plan Deny; High risk)
+- [x] `/mcp` command: list servers/tools, on/off toggle, login/logout, connected/failed/needs-auth status
+- [x] MCP tools appear in preamble index + `last_tool_events` tree; full OAuth 2.0 (0600 token store, localhost callback, 401 refresh-once → needs-auth)
 
 ### 4. `@file` / ref-files (`feat/ref-files` exists, not landed)
 - [ ] Land `feat/ref-files`: `@path` expansion before `chat()`

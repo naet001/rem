@@ -3,6 +3,7 @@ mod config;
 mod context;
 mod history;
 mod markdown;
+mod mcp;
 mod modes;
 mod permissions;
 mod popup;
@@ -42,6 +43,12 @@ async fn main() {
         } else {
             i += 1;
         }
+    }
+
+    // MCP servers (warn-and-continue: bad entries log, session proceeds).
+    let mcp = crate::mcp::load();
+    for w in &mcp.warnings {
+        eprintln!("rem: {w}");
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -98,13 +105,37 @@ async fn main() {
 
     let (approval_tx, approval_rx) = permissions::approval_channel();
 
-    let agent = match RigAgent::new(&cfg, approval_tx, project_root) {
+    // Build the agent first so the shared tool registry exists, then
+    // connect MCP servers onto it. Warn-and-continue: failures log,
+    // the session proceeds on remainder + built-ins. Held connections
+    // live in the agent's shared MCP records (process lifetime).
+    let mut agent = match RigAgent::new(&cfg, approval_tx, project_root) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("rem: {e}");
             std::process::exit(1);
         }
     };
+    let report =
+        crate::mcp::connect_all(&mcp, &agent.tool_server_handle(), agent.mcp_state()).await;
+    // Startup auto-login display: printable auth URLs for every
+    // needs-auth server (SSH/headless copy-paste contract).
+    for hint in
+        crate::mcp::needs_auth_login_hints(&crate::mcp::needs_auth_servers(agent.mcp_state()))
+    {
+        eprintln!("rem: {hint}");
+    }
+    for w in &report.warnings {
+        // Config-load warnings already printed above; connect_all
+        // carries them through, so dedupe by skipping known ones.
+        if !mcp.warnings.contains(w) {
+            eprintln!("rem: {w}");
+        }
+    }
+    let section = crate::mcp::preamble_section(&report.inventory);
+    if let Err(e) = agent.rebuild_preamble_with_mcp_section(&section) {
+        eprintln!("rem: mcp preamble rebuild failed: {e}");
+    }
 
     // Preload resumed history before the TUI owns the agent.
     if let Err(e) = agent.import_messages_json(&session.messages_json).await {
