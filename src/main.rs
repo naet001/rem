@@ -22,7 +22,9 @@ async fn main() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("rem: {e}");
-            eprintln!("hint: create ~/.config/rem/config.toml with [api] and [model] sections");
+            eprintln!(
+                "hint: create ~/.config/rem/config.toml with active_provider + [providers.*] sections (see config.example.toml)"
+            );
             std::process::exit(1);
         }
     };
@@ -73,22 +75,31 @@ async fn main() {
                 std::process::exit(1);
             }
         },
-        None => match sessions::create_session(&conn, &project_root_str, &cfg.model.default) {
-            Ok(s) => {
-                if let Err(e) = sessions::update_title(&conn, &s.id, "untitled") {
+        None => {
+            let tag = match cfg.active() {
+                Ok(r) => format!("{}:{}", r.name, r.model),
+                Err(e) => {
                     eprintln!("rem: {e}");
                     std::process::exit(1);
                 }
-                sessions::get_session(&conn, &s.id)
-                    .ok()
-                    .flatten()
-                    .unwrap_or(s)
+            };
+            match sessions::create_session(&conn, &project_root_str, &tag) {
+                Ok(s) => {
+                    if let Err(e) = sessions::update_title(&conn, &s.id, "untitled") {
+                        eprintln!("rem: {e}");
+                        std::process::exit(1);
+                    }
+                    sessions::get_session(&conn, &s.id)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(s)
+                }
+                Err(e) => {
+                    eprintln!("rem: {e}");
+                    std::process::exit(1);
+                }
             }
-            Err(e) => {
-                eprintln!("rem: {e}");
-                std::process::exit(1);
-            }
-        },
+        }
     };
     // Keep the in-memory copy consistent even if the refetch above failed.
     if session.title != "untitled" && !is_resume {

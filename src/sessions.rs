@@ -141,6 +141,17 @@ pub fn update_title(conn: &Connection, id: &str, title: &str) -> Result<(), Stri
     .map_err(|e| format!("update_title: {e}"))
 }
 
+/// Persist the active `provider:model` tag after a `/model` switch so
+/// resume lands on the right client. Mirrors `update_title`.
+pub fn update_model(conn: &Connection, id: &str, model: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE id = ?3",
+        rusqlite::params![model, now(), id],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("update_model: {e}"))
+}
+
 pub fn touch(conn: &Connection, id: &str) -> Result<(), String> {
     conn.execute(
         "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",

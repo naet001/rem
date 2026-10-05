@@ -172,6 +172,9 @@ fn run_app(
         let mut app = App::new(model, effort);
         // Skills index for `/skill:<partial>` suggestions (Task 14 cache).
         app.skill_names = agent.list_skills().iter().map(|s| s.name.clone()).collect();
+        // Model combos for `/model <partial>` suggestions. Same cache
+        // shape as skills; refreshed after every `/model` switch.
+        app.model_names = agent.list_models();
         // Resume: on relaunch with REM_SESSION_ID set, replay the stored
         // transcript so the pane shows prior turns before new input.
         if let Ok(sid) = std::env::var("REM_SESSION_ID")
@@ -363,6 +366,24 @@ static COMMANDS: &[Command] = &[
         desc: "list or reload skills",
         hint: "[reload]",
     },
+    Command {
+        name: "model",
+        takes_arg: true,
+        desc: "list or switch provider/model",
+        hint: "[[provider:]name]",
+    },
+    Command {
+        name: "effort",
+        takes_arg: true,
+        desc: "show or set reasoning effort",
+        hint: "[low|medium|high]",
+    },
+    Command {
+        name: "context",
+        takes_arg: false,
+        desc: "show local context usage",
+        hint: "",
+    },
 ];
 
 /// Fixed instruction for `/init` (ADR-0009): runs as a normal agent turn so
@@ -439,10 +460,13 @@ fn menu_matches_token(token: &str) -> Vec<&'static Command> {
 }
 
 /// Live menu rows at caret. Mid-input case 1. Theme-arg mode same as old
-/// (`/theme <partial>` where partial has no space). Skill-arg mode
+/// (`/theme <partial>` where partial has no space). Model-arg mode
+/// (`/model <partial>`) draws suggestions from the `App.model_names`
+/// cache — pass `&[]` when no cache exists (pure command/theme tests).
+/// Skill-arg mode
 /// (`/skill:<partial>`) draws suggestions from the `App.skill_names`
 /// cache — pass `&[]` when no cache exists (pure command/theme tests).
-fn menu_live(input: &str, cursor: usize, skills: &[String]) -> MenuLive {
+fn menu_live(input: &str, cursor: usize, skills: &[String], models: &[String]) -> MenuLive {
     let before: String = input.chars().take(cursor).collect();
     // Theme-arg case: `/theme <partial>` or bare `/theme `.
     // This must be checked before token walk-back because the cursor may
@@ -469,6 +493,53 @@ fn menu_live(input: &str, cursor: usize, skills: &[String]) -> MenuLive {
             return MenuLive::Closed;
         }
         return MenuLive::Themes {
+            names,
+            b_start,
+            b_end,
+        };
+    }
+    // Model-arg case: `/model <partial>` or bare `/model `. Same shape
+    // as the theme-arg case; candidates come from the `App.model_names`
+    // cache (no agent access on the keystroke path).
+    if let Some(partial) = model_arg_partial_at(&before) {
+        let prefix_end = before
+            .rfind("/model")
+            .map(|i| i + "/model".len())
+            .unwrap_or(before.len());
+        let b_start = before[prefix_end..]
+            .bytes()
+            .position(|b| !b.is_ascii_whitespace())
+            .map(|i| prefix_end + i)
+            .unwrap_or(before.len());
+        let b_end = before.len();
+        let names = match_model_names(models, &partial);
+        if names.is_empty() {
+            return MenuLive::Closed;
+        }
+        return MenuLive::Models {
+            names,
+            b_start,
+            b_end,
+        };
+    }
+    // Effort-arg case: `/effort <partial>` or bare `/effort `. Same span
+    // shape; candidates are the three static levels.
+    if let Some(partial) = effort_arg_partial_at(&before) {
+        let prefix_end = before
+            .rfind("/effort")
+            .map(|i| i + "/effort".len())
+            .unwrap_or(before.len());
+        let b_start = before[prefix_end..]
+            .bytes()
+            .position(|b| !b.is_ascii_whitespace())
+            .map(|i| prefix_end + i)
+            .unwrap_or(before.len());
+        let b_end = before.len();
+        let names = match_effort_names(&partial);
+        if names.is_empty() {
+            return MenuLive::Closed;
+        }
+        return MenuLive::Efforts {
             names,
             b_start,
             b_end,
@@ -518,11 +589,69 @@ enum MenuLive {
         b_start: usize,
         b_end: usize,
     },
+    Models {
+        names: Vec<String>,
+        b_start: usize,
+        b_end: usize,
+    },
+    Efforts {
+        names: Vec<String>,
+        b_start: usize,
+        b_end: usize,
+    },
     Skills {
         names: Vec<String>,
         b_start: usize,
         b_end: usize,
     },
+}
+
+/// `/model <partial>` check on text before caret. Mirrors
+/// [`theme_arg_partial_at`]: the `/` must be at start or after
+/// whitespace, the partial carries no whitespace.
+fn model_arg_partial_at(before: &str) -> Option<String> {
+    // Find last `/model ` run before caret.
+    let idx = before.rfind("/model")?;
+    let rest = &before[idx + "/model".len()..];
+    if rest.is_empty() || !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    // `/` of `/model` must be at start or after space.
+    if idx > 0 {
+        let prev = before[..idx].chars().last()?;
+        if !prev.is_whitespace() {
+            return None;
+        }
+    }
+    let partial = rest.trim_start();
+    if partial.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some(partial.to_string())
+}
+
+/// `/effort <partial>` check on text before caret. Mirrors
+/// [`theme_arg_partial_at`]: the `/` must be at start or after
+/// whitespace, the partial carries no whitespace.
+fn effort_arg_partial_at(before: &str) -> Option<String> {
+    // Find last `/effort ` run before caret.
+    let idx = before.rfind("/effort")?;
+    let rest = &before[idx + "/effort".len()..];
+    if rest.is_empty() || !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    // `/` of `/effort` must be at start or after space.
+    if idx > 0 {
+        let prev = before[..idx].chars().last()?;
+        if !prev.is_whitespace() {
+            return None;
+        }
+    }
+    let partial = rest.trim_start();
+    if partial.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some(partial.to_string())
 }
 
 /// `/theme <partial>` check on text before caret. Same rules as
@@ -614,6 +743,75 @@ fn theme_arg_matches(input: &str) -> Vec<String> {
         Ok(names) => match_theme_names(&names, &partial),
         Err(_) => Vec::new(),
     }
+}
+
+/// Model-arg partial: the menu suggests cached `provider:model` combos
+/// while the input is `/model <partial>` — the `model` command, exactly
+/// one whitespace run, then a partial combo with no whitespace. Returns
+/// the partial (empty = bare `/model `, list everything). `None` for
+/// anything else: bare `/model` belongs to the command menu, multi-token
+/// args dispatch directly. Case-sensitive, mirroring `menu_matches`.
+fn model_arg_partial(input: &str) -> Option<String> {
+    let rest = input.strip_prefix('/')?;
+    let partial = rest.strip_prefix("model")?;
+    if partial.is_empty() || !partial.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let partial = partial.trim_start();
+    if partial.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some(partial.to_string())
+}
+
+/// Prefix-filter cached model combos, order preserved. Pure seam for
+/// tests; the live path composes this with the `App.model_names` cache.
+fn match_model_names(names: &[String], partial: &str) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| n.starts_with(partial))
+        .cloned()
+        .collect()
+}
+
+/// Live model suggestions for `/model <partial>`: cached combos filtered
+/// by prefix. Empty cache → no suggestions (menu stays closed).
+fn model_arg_matches_for(input: &str, names: &[String]) -> Vec<String> {
+    let Some(partial) = model_arg_partial(input) else {
+        return Vec::new();
+    };
+    match_model_names(names, &partial)
+}
+
+/// Effort levels in canonical order. Single source for the `/effort`
+/// popup and docs; dispatch validates against the same set.
+const EFFORT_LEVELS: &[&str] = &["low", "medium", "high"];
+
+/// Effort-arg partial: the menu suggests `low`/`medium`/`high` while the
+/// input is `/effort <partial>` — same single-whitespace-run shape as
+/// `/theme` and `/model`. Returns the partial (empty = bare `/effort `,
+/// list everything). `None` for anything else. Case-sensitive.
+fn effort_arg_partial(input: &str) -> Option<String> {
+    let rest = input.strip_prefix('/')?;
+    let partial = rest.strip_prefix("effort")?;
+    if partial.is_empty() || !partial.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let partial = partial.trim_start();
+    if partial.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some(partial.to_string())
+}
+
+/// Prefix-filter effort levels, canonical order preserved. Pure seam for
+/// tests; the live path composes this with the static level list.
+fn match_effort_names(partial: &str) -> Vec<String> {
+    EFFORT_LEVELS
+        .iter()
+        .filter(|n| n.starts_with(partial))
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Skill-arg partial: the menu suggests discovered skill names while the
@@ -980,7 +1178,7 @@ fn is_menu_open(app: &App) -> bool {
 /// True when live float menu shows at caret (mid-input case 1).
 fn is_menu_live(app: &App) -> bool {
     !matches!(
-        menu_live(&app.input, app.cursor, &app.skill_names),
+        menu_live(&app.input, app.cursor, &app.skill_names, &app.model_names),
         MenuLive::Closed
     )
 }
@@ -1034,10 +1232,12 @@ fn at_row_count(app: &App) -> usize {
 
 /// Reconcile `menu_sel` and `at_sel` with the current input after an edit.
 fn clamp_menu_sel(app: &mut App) {
-    let n = match menu_live(&app.input, app.cursor, &app.skill_names) {
+    let n = match menu_live(&app.input, app.cursor, &app.skill_names, &app.model_names) {
         MenuLive::Closed => menu_row_count(&app.input),
         MenuLive::Commands { cmds, .. } => cmds.len(),
         MenuLive::Themes { names, .. } => names.len(),
+        MenuLive::Models { names, .. } => names.len(),
+        MenuLive::Efforts { names, .. } => names.len(),
         MenuLive::Skills { names, .. } => names.len(),
     };
     if n == 0 {
@@ -1057,7 +1257,7 @@ fn clamp_menu_sel(app: &mut App) {
 /// Fill top pick into text at caret token span. Mid-input safe.
 /// `fix bug /res` -> `fix bug /resume`. Cursor lands after filled text.
 fn complete_menu_at_caret(app: &mut App) {
-    let live = menu_live(&app.input, app.cursor, &app.skill_names);
+    let live = menu_live(&app.input, app.cursor, &app.skill_names, &app.model_names);
     match live {
         MenuLive::Closed => {}
         MenuLive::Commands {
@@ -1085,6 +1285,38 @@ fn complete_menu_at_caret(app: &mut App) {
             let idx = app.menu_sel.unwrap_or(0).min(names.len() - 1);
             // Replace partial after `/theme ` with picked name.
             // b_start..b_end covers `/partial`; keep `/theme ` head.
+            let fill = names[idx].clone();
+            app.input.replace_range(b_start..b_end, &fill);
+            app.cursor = app.input[..b_start + fill.len()].chars().count();
+            clamp_menu_sel(app);
+        }
+        MenuLive::Models {
+            names,
+            b_start,
+            b_end,
+        } => {
+            if names.is_empty() {
+                return;
+            }
+            let idx = app.menu_sel.unwrap_or(0).min(names.len() - 1);
+            // Same span shape as themes: replace partial after `/model `
+            // with the picked `provider:model` combo.
+            let fill = names[idx].clone();
+            app.input.replace_range(b_start..b_end, &fill);
+            app.cursor = app.input[..b_start + fill.len()].chars().count();
+            clamp_menu_sel(app);
+        }
+        MenuLive::Efforts {
+            names,
+            b_start,
+            b_end,
+        } => {
+            if names.is_empty() {
+                return;
+            }
+            let idx = app.menu_sel.unwrap_or(0).min(names.len() - 1);
+            // Same span shape: replace partial after `/effort ` with the
+            // picked level.
             let fill = names[idx].clone();
             app.input.replace_range(b_start..b_end, &fill);
             app.cursor = app.input[..b_start + fill.len()].chars().count();
@@ -1149,6 +1381,9 @@ struct App {
     /// Cached skill folder names for `/skill:<partial>` suggestions.
     /// Refreshed at startup and on `/skills reload`.
     skill_names: Vec<String>,
+    /// Cached `provider:model` combos for `/model <partial>` suggestions.
+    /// Snapshotted at startup, refreshed after every `/model` switch.
+    model_names: Vec<String>,
     /// @-mention menu selection index (ADR-0012). `None` = menu closed;
     /// `Some(i)` = menu open with row `i` highlighted. Suppressed when
     /// the `/` menu is open (`/`-wins precedence).
@@ -1321,6 +1556,7 @@ impl App {
             streamed_tools: 0,
             menu_sel: None,
             skill_names: Vec::new(),
+            model_names: Vec::new(),
             at_sel: None,
             pending_approvals: VecDeque::new(),
             approval_sel: 0,
@@ -1879,6 +2115,21 @@ fn handle_key(
                             Ok(Some(s)) => {
                                 app.session_id = s.id.clone();
                                 app.session_title = s.title.clone();
+                                // Same stored-tag restore as `/resume <id>`.
+                                if !s.model.is_empty() && s.model != agent.model_name() {
+                                    match agent.switch_model_sync(&s.model) {
+                                        Ok(tag) => {
+                                            app.model = tag;
+                                        }
+                                        Err(e) => {
+                                            app.enqueue_notice(format!(
+                                                "resume: stored model {} unavailable ({e}), kept {}",
+                                                s.model,
+                                                agent.model_name()
+                                            ));
+                                        }
+                                    }
+                                }
                                 match agent.import_sync(&s.messages_json) {
                                     Ok(()) => {
                                         app.replay_json(&s.messages_json);
@@ -1905,10 +2156,12 @@ fn handle_key(
     let live_open = is_menu_live(app);
     if live_open {
         // Count rows from live token (not whole input).
-        let live_n = match menu_live(&app.input, app.cursor, &app.skill_names) {
+        let live_n = match menu_live(&app.input, app.cursor, &app.skill_names, &app.model_names) {
             MenuLive::Closed => 0,
             MenuLive::Commands { cmds, .. } => cmds.len(),
             MenuLive::Themes { names, .. } => names.len(),
+            MenuLive::Models { names, .. } => names.len(),
+            MenuLive::Efforts { names, .. } => names.len(),
             MenuLive::Skills { names, .. } => names.len(),
         };
         match code {
@@ -2263,7 +2516,7 @@ fn submit(
     // then fall to old start-only paths. Enter picks suggestion.
     if !skill_turn
         && !matches!(
-            menu_live(&app.input, app.cursor, &app.skill_names),
+            menu_live(&app.input, app.cursor, &app.skill_names, &app.model_names),
             MenuLive::Closed
         )
     {
@@ -2279,6 +2532,24 @@ fn submit(
         if !names.is_empty() {
             let idx = app.menu_sel.unwrap_or(0).min(names.len() - 1);
             text = format!("/theme {}", names[idx]);
+        }
+    }
+    // Model-arg accept: same shape — `/model <partial>` with suggestions
+    // open resolves the highlighted `provider:model` combo first.
+    if menu_matches(&text).is_empty() {
+        let names = model_arg_matches_for(&text, &app.model_names);
+        if !names.is_empty() {
+            let idx = app.menu_sel.unwrap_or(0).min(names.len() - 1);
+            text = format!("/model {}", names[idx]);
+        }
+    }
+    // Effort-arg accept: same shape — `/effort <partial>` resolves the
+    // highlighted level first.
+    if menu_matches(&text).is_empty() {
+        let names = match_effort_names(&effort_arg_partial(&text).unwrap_or_default());
+        if effort_arg_partial(&text).is_some() && !names.is_empty() {
+            let idx = app.menu_sel.unwrap_or(0).min(names.len() - 1);
+            text = format!("/effort {}", names[idx]);
         }
     }
     // Prefix-run (ADR-0007): a menu-eligible prefix resolves to the
@@ -2370,6 +2641,23 @@ fn submit(
                         Ok(Some(s)) => {
                             app.session_id = s.id.clone();
                             app.session_title = s.title.clone();
+                            // Restore the stored provider tag so the resumed
+                            // turn runs on the same client. Unknown tags
+                            // (config changed since) warn but keep history.
+                            if !s.model.is_empty() && s.model != agent.model_name() {
+                                match agent.switch_model_sync(&s.model) {
+                                    Ok(tag) => {
+                                        app.model = tag;
+                                    }
+                                    Err(e) => {
+                                        app.enqueue_notice(format!(
+                                            "resume: stored model {} unavailable ({e}), kept {}",
+                                            s.model,
+                                            agent.model_name()
+                                        ));
+                                    }
+                                }
+                            }
                             match agent.import_sync(&s.messages_json) {
                                 Ok(()) => {
                                     app.replay_json(&s.messages_json);
@@ -2480,6 +2768,81 @@ fn submit(
                     }
                     app.enqueue_notice(msg);
                 }
+                return false;
+            }
+            "model" => {
+                if app.busy {
+                    app.enqueue_notice("model: busy — switch after the turn finishes".to_string());
+                    return false;
+                }
+                if arg.trim().is_empty() {
+                    let combos = agent.list_models();
+                    match combos.is_empty() {
+                        true => app.enqueue_notice("no providers configured".to_string()),
+                        false => {
+                            let mut msg = String::from("models:");
+                            for c in combos {
+                                msg.push_str(&format!("\n  {c}"));
+                            }
+                            app.enqueue_notice(msg);
+                        }
+                    }
+                    return false;
+                }
+                match agent.switch_model_sync(arg.trim()) {
+                    Ok(tag) => {
+                        app.model = tag.clone();
+                        // Refresh the popup cache so the next `/model `
+                        // lists the live model.
+                        app.model_names = agent.list_models();
+                        // Persist the tag so resume lands on this client.
+                        // Failures surface, never silent.
+                        if let Ok(conn) = crate::sessions::open() {
+                            if let Err(e) =
+                                crate::sessions::update_model(&conn, &app.session_id, &tag)
+                            {
+                                app.enqueue_notice(format!(
+                                    "switched to {tag} (model persist failed: {e})"
+                                ));
+                            } else {
+                                app.enqueue_notice(format!("switched to {tag}"));
+                            }
+                        } else {
+                            app.enqueue_notice(format!("switched to {tag}"));
+                        }
+                    }
+                    Err(e) => app.enqueue_notice(format!("model: {e}")),
+                }
+                return false;
+            }
+            "effort" => {
+                if app.busy {
+                    app.enqueue_notice("effort: busy — switch after the turn finishes".to_string());
+                    return false;
+                }
+                if arg.trim().is_empty() {
+                    app.enqueue_notice(format!("effort: {}", agent.effort_name()));
+                    return false;
+                }
+                match agent.set_effort_sync(arg.trim()) {
+                    Ok(level) => {
+                        app.effort = level.clone();
+                        app.enqueue_notice(format!("effort: {level}"));
+                    }
+                    Err(e) => app.enqueue_notice(format!("effort: {e}")),
+                }
+                return false;
+            }
+            "context" => {
+                let s = agent.context_stats_sync();
+                let summary = match s.summarized {
+                    true => "summarized",
+                    false => "no summary yet",
+                };
+                app.enqueue_notice(format!(
+                    "context: {} messages (~{} chars) · compact past {} keep {} · {}",
+                    s.messages, s.chars, s.trigger, s.keep, summary
+                ));
                 return false;
             }
             _ => {}
@@ -3354,11 +3717,13 @@ fn render_status(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
 /// Float slash menu. Small box with border, above input line.
 /// Same rows as old band, but in float box. Gray hint text included.
 fn render_menu_float(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let live = menu_live(&app.input, app.cursor, &app.skill_names);
+    let live = menu_live(&app.input, app.cursor, &app.skill_names, &app.model_names);
     // Mode tag: skill rows render like theme rows (`▸ <name>`).
     let (mode, total) = match &live {
         MenuLive::Commands { cmds, .. } => ("cmds", cmds.len()),
         MenuLive::Themes { names, .. } => ("themes", names.len()),
+        MenuLive::Models { names, .. } => ("models", names.len()),
+        MenuLive::Efforts { names, .. } => ("efforts", names.len()),
         MenuLive::Skills { names, .. } => ("skills", names.len()),
         MenuLive::Closed => {
             // @-mention menu (ADR-0012): renders in the same float slot
@@ -3435,6 +3800,65 @@ fn render_menu_float(f: &mut ratatui::Frame, app: &App, area: Rect) {
                 false => Span::styled("  ", Style::default().bg(theme.pane_bg)),
             };
             let is_current = *name == app.theme.name;
+            let label = match is_current {
+                true => format!("{name}  ●"),
+                false => name.clone(),
+            };
+            lines.push(mk_row(
+                selected,
+                marker,
+                vec![Span::styled(label, sel_style(selected))],
+            ));
+        }
+    } else if mode == "models" {
+        let MenuLive::Models { names, .. } = &live else {
+            return;
+        };
+        // Model rows render like theme rows (`▸ <combo>`); Tab/Enter
+        // completes the full `provider:model` combo. The live combo
+        // (matching the footer tag) gets the current marker.
+        for (i, name) in names.iter().enumerate().skip(start).take(show_rows) {
+            let selected = i == sel;
+            let marker = match selected {
+                true => Span::styled(
+                    "▸ ",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(theme.menu_sel_bg),
+                ),
+                false => Span::styled("  ", Style::default().bg(theme.pane_bg)),
+            };
+            let is_current = *name == app.model;
+            let label = match is_current {
+                true => format!("{name}  ●"),
+                false => name.clone(),
+            };
+            lines.push(mk_row(
+                selected,
+                marker,
+                vec![Span::styled(label, sel_style(selected))],
+            ));
+        }
+    } else if mode == "efforts" {
+        let MenuLive::Efforts { names, .. } = &live else {
+            return;
+        };
+        // Effort rows render like theme rows (`▸ <level>`); the live
+        // level (matching the footer) gets the current marker.
+        for (i, name) in names.iter().enumerate().skip(start).take(show_rows) {
+            let selected = i == sel;
+            let marker = match selected {
+                true => Span::styled(
+                    "▸ ",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(theme.menu_sel_bg),
+                ),
+                false => Span::styled("  ", Style::default().bg(theme.pane_bg)),
+            };
+            let is_current = *name == app.effort;
             let label = match is_current {
                 true => format!("{name}  ●"),
                 false => name.clone(),
@@ -4800,7 +5224,7 @@ mod tests {
                 .map(|c| c.name)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names("/c"), vec!["clear"]);
+        assert_eq!(names("/c"), vec!["clear", "context"]);
         assert_eq!(names("/qu"), vec!["quit"]);
         assert_eq!(names("/h"), vec!["help"]);
         assert!(menu_matches("/C").is_empty());
@@ -4836,7 +5260,7 @@ mod tests {
         app.input = "/c".to_string();
         app.menu_sel = Some(2);
         clamp_menu_sel(&mut app);
-        assert_eq!(app.menu_sel, Some(0));
+        assert_eq!(app.menu_sel, Some(1));
         app.input = "hello".to_string();
         clamp_menu_sel(&mut app);
         assert_eq!(app.menu_sel, None);
@@ -4856,9 +5280,9 @@ mod tests {
         app.cursor = 1;
         app.menu_sel = Some(0);
         app.history = vec!["old turn".to_string()];
-        // 9 registry commands: quit, clear, help, theme, init, resume,
-        // rename, fork, skills.
-        for expect in [1, 2, 3, 4, 5, 6, 7, 8, 0] {
+        // 12 registry commands: quit, clear, help, theme, init, resume,
+        // rename, fork, skills, model, effort, context.
+        for expect in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0] {
             assert!(!handle_key(
                 &mut app,
                 &agent,
@@ -4877,7 +5301,7 @@ mod tests {
             KeyCode::Up,
             KeyModifiers::empty()
         ));
-        assert_eq!(app.menu_sel, Some(8));
+        assert_eq!(app.menu_sel, Some(11));
         assert_eq!(app.hist_idx, None);
         assert_eq!(app.input, "/");
         assert_eq!(app.history, vec!["old turn".to_string()]);
@@ -4895,6 +5319,260 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[tokio::test]
+    async fn slash_model_bare_lists_combos_without_turn() {
+        let mut app = App::new("openai:gpt-4o".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(ModelStubAgent::new());
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/model".to_string();
+        app.cursor = 6;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy, "/model must not start a turn");
+        let flat = print_flat(&app);
+        assert!(flat.contains("anthropic:claude-sonnet-4-5"), "got: {flat}");
+        assert!(flat.contains("openai:gpt-4o"), "got: {flat}");
+    }
+
+    #[tokio::test]
+    async fn slash_model_switch_updates_footer_and_notices_without_turn() {
+        let mut app = App::new("openai:gpt-4o".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(ModelStubAgent::new());
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/model anthropic:claude-haiku-4-5".to_string();
+        app.cursor = app.input.chars().count();
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy, "/model must not start a turn");
+        assert_eq!(app.model, "anthropic:claude-haiku-4-5");
+        let flat = print_flat(&app);
+        assert!(
+            flat.contains("switched to anthropic:claude-haiku-4-5"),
+            "got: {flat}"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_model_unknown_provider_errors_without_touching_footer() {
+        let mut app = App::new("openai:gpt-4o".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(ModelStubAgent::new());
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/model nope:model".to_string();
+        app.cursor = app.input.chars().count();
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy, "/model must not start a turn");
+        assert_eq!(app.model, "openai:gpt-4o");
+        let flat = print_flat(&app);
+        assert!(flat.contains("unknown provider"), "got: {flat}");
+    }
+
+    #[tokio::test]
+    async fn slash_model_busy_refuses_without_side_effects() {
+        // `submit()` returns early while a turn runs, so the live tag is
+        // never touched — same layered defense as `/skills reload`.
+        let mut app = App::new("openai:gpt-4o".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.busy = true;
+        let agent = std::sync::Arc::new(ModelStubAgent::new());
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/model gpt-4o-mini".to_string();
+        app.cursor = app.input.chars().count();
+        assert!(!submit(&mut app, &agent, &tx, &think_tx));
+        assert_eq!(app.model, "openai:gpt-4o");
+        assert_eq!(agent.model_name(), "openai:gpt-4o");
+    }
+
+    #[tokio::test]
+    async fn slash_effort_busy_refuses_without_side_effects() {
+        let mut app = App::new("openai:gpt-4o".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.busy = true;
+        let agent = std::sync::Arc::new(ModelStubAgent::new());
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/effort high".to_string();
+        app.cursor = app.input.chars().count();
+        assert!(!submit(&mut app, &agent, &tx, &think_tx));
+        assert_eq!(app.effort, "medium");
+        assert_eq!(agent.effort_name(), "medium");
+    }
+
+    #[tokio::test]
+    async fn slash_effort_show_and_set_without_turn() {
+        let mut app = App::new("openai:gpt-4o".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(ModelStubAgent::new());
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        // Bare form shows the current level.
+        app.input = "/effort".to_string();
+        app.cursor = 7;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy, "/effort must not start a turn");
+        assert!(print_flat(&app).contains("effort: medium"));
+        // Set form updates the footer.
+        app.input = "/effort high".to_string();
+        app.cursor = app.input.chars().count();
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy, "/effort must not start a turn");
+        assert_eq!(app.effort, "high");
+        assert!(print_flat(&app).contains("effort: high"));
+    }
+
+    #[tokio::test]
+    async fn slash_model_popup_opens_filters_and_tab_completes() {
+        let mut app = App::new("openai:big-pickle".to_string(), "medium".to_string());
+        app.model_names = vec![
+            "anthropic:claude-haiku-4-5".to_string(),
+            "openai:big-pickle".to_string(),
+        ];
+        // Bare `/model ` lists everything.
+        app.input = "/model ".to_string();
+        app.cursor = app.input.chars().count();
+        clamp_menu_sel(&mut app);
+        let live = menu_live(&app.input, app.cursor, &app.skill_names, &app.model_names);
+        let MenuLive::Models { names, .. } = &live else {
+            panic!("expected Models popup, got closed/other");
+        };
+        assert_eq!(names.len(), 2);
+        // Partial narrows to the matching combo.
+        app.input = "/model an".to_string();
+        app.cursor = app.input.chars().count();
+        clamp_menu_sel(&mut app);
+        let live = menu_live(&app.input, app.cursor, &app.skill_names, &app.model_names);
+        let MenuLive::Models { names, .. } = &live else {
+            panic!("expected Models popup");
+        };
+        assert_eq!(names, &vec!["anthropic:claude-haiku-4-5".to_string()]);
+        // Tab completes the highlighted combo.
+        app.menu_sel = Some(0);
+        complete_menu_at_caret(&mut app);
+        assert_eq!(app.input, "/model anthropic:claude-haiku-4-5");
+        // Substring mid-combo matches nothing → menu closed.
+        app.input = "/model haiku".to_string();
+        app.cursor = app.input.chars().count();
+        assert!(matches!(
+            menu_live(&app.input, app.cursor, &app.skill_names, &app.model_names),
+            MenuLive::Closed
+        ));
+    }
+
+    #[tokio::test]
+    async fn slash_effort_popup_opens_filters_and_tab_completes() {
+        let mut app = App::new("openai:big-pickle".to_string(), "medium".to_string());
+        // Bare `/effort ` lists all three levels.
+        app.input = "/effort ".to_string();
+        app.cursor = app.input.chars().count();
+        clamp_menu_sel(&mut app);
+        let live = menu_live(&app.input, app.cursor, &app.skill_names, &app.model_names);
+        let MenuLive::Efforts { names, .. } = &live else {
+            panic!("expected Efforts popup, got closed/other");
+        };
+        assert_eq!(names.len(), 3);
+        // Partial narrows.
+        app.input = "/effort h".to_string();
+        app.cursor = app.input.chars().count();
+        clamp_menu_sel(&mut app);
+        let live = menu_live(&app.input, app.cursor, &app.skill_names, &app.model_names);
+        let MenuLive::Efforts { names, .. } = &live else {
+            panic!("expected Efforts popup");
+        };
+        assert_eq!(names, &vec!["high".to_string()]);
+        // Tab completes the highlighted level.
+        app.menu_sel = Some(0);
+        complete_menu_at_caret(&mut app);
+        assert_eq!(app.input, "/effort high");
+    }
+
+    #[tokio::test]
+    async fn slash_model_enter_accepts_highlighted_combo_before_dispatch() {
+        let mut app = App::new("openai:big-pickle".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.model_names = vec![
+            "anthropic:claude-haiku-4-5".to_string(),
+            "openai:big-pickle".to_string(),
+        ];
+        let agent = std::sync::Arc::new(ModelStubAgent::new());
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        // `/model an` + highlighted pick → Enter resolves to the full
+        // combo, then dispatch switches.
+        app.input = "/model an".to_string();
+        app.cursor = app.input.chars().count();
+        app.menu_sel = Some(0);
+        assert!(!submit(&mut app, &agent, &tx, &think_tx));
+        assert_eq!(agent.model_name(), "anthropic:claude-haiku-4-5");
+        assert_eq!(app.model, "anthropic:claude-haiku-4-5");
+    }
+
+    #[tokio::test]
+    async fn slash_context_reports_local_usage_without_turn() {
+        let mut app = App::new("openai:gpt-4o".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(ModelStubAgent::new());
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/context".to_string();
+        app.cursor = 8;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy, "/context must not start a turn");
+        let flat = print_flat(&app);
+        // Independent literals from the stubbed stats above. Rows wrap,
+        // so multi-word tails are asserted per word.
+        assert!(flat.contains("7 messages"), "got: {flat}");
+        assert!(flat.contains("~1234 chars"), "got: {flat}");
+        assert!(flat.contains("past 100"), "got: {flat}");
+        assert!(flat.contains("keep 40"), "got: {flat}");
+        assert!(flat.contains("no summary"), "got: {flat}");
     }
 
     #[tokio::test]
@@ -5079,7 +5757,7 @@ mod tests {
         // The live float menu sees all 7 skill rows.
         app.input = "/skill:".to_string();
         app.cursor = 7;
-        let live = menu_live(&app.input, app.cursor, &app.skill_names);
+        let live = menu_live(&app.input, app.cursor, &app.skill_names, &app.model_names);
         match live {
             MenuLive::Skills { names, .. } => assert_eq!(names.len(), 7),
             other => panic!("expected Skills menu, got: {other:?}"),
@@ -5326,7 +6004,10 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        for name in ["/quit", "/clear", "/help", "/theme", "/init", "/skills"] {
+        for name in [
+            "/quit", "/clear", "/help", "/theme", "/init", "/skills", "/model", "/effort",
+            "/context",
+        ] {
             assert!(flat.contains(name), "help missing {name}: {flat}");
         }
         assert!(flat.contains("quit the app"), "help missing desc: {flat}");
@@ -5561,6 +6242,87 @@ mod tests {
         assert_eq!(theme_arg_partial("/themes x"), None);
         assert_eq!(theme_arg_partial("theme "), None);
         assert_eq!(theme_arg_partial("/THEME "), None);
+    }
+
+    #[test]
+    fn effort_arg_partial_only_matches_single_arg_form() {
+        assert_eq!(effort_arg_partial("/effort "), Some(String::new()));
+        assert_eq!(effort_arg_partial("/effort h"), Some("h".to_string()));
+        assert_eq!(effort_arg_partial("/effort high"), Some("high".to_string()));
+        assert_eq!(effort_arg_partial("/effort"), None);
+        assert_eq!(effort_arg_partial("/eff"), None);
+        assert_eq!(effort_arg_partial("/clear "), None);
+        assert_eq!(effort_arg_partial("/effort a b"), None);
+        assert_eq!(effort_arg_partial("/effort high "), None);
+        assert_eq!(effort_arg_partial("/efforthigh"), None);
+        assert_eq!(effort_arg_partial("/efforts x"), None);
+        assert_eq!(effort_arg_partial("effort "), None);
+        assert_eq!(effort_arg_partial("/EFFORT "), None);
+    }
+
+    #[test]
+    fn match_effort_names_filters_levels_by_prefix_in_order() {
+        assert_eq!(
+            match_effort_names(""),
+            vec!["low".to_string(), "medium".to_string(), "high".to_string()]
+        );
+        assert_eq!(match_effort_names("h"), vec!["high".to_string()]);
+        assert_eq!(match_effort_names("m"), vec!["medium".to_string()]);
+        assert!(match_effort_names("xyz").is_empty());
+        assert!(match_effort_names("H").is_empty(), "case-sensitive");
+    }
+
+    #[test]
+    fn model_arg_partial_only_matches_single_arg_form() {
+        assert_eq!(model_arg_partial("/model "), Some(String::new()));
+        assert_eq!(model_arg_partial("/model an"), Some("an".to_string()));
+        assert_eq!(
+            model_arg_partial("/model anthropic:claude"),
+            Some("anthropic:claude".to_string())
+        );
+        // Bare `/model` belongs to the command menu, not arg mode.
+        assert_eq!(model_arg_partial("/model"), None);
+        assert_eq!(model_arg_partial("/mod"), None);
+        // Other commands never trigger arg mode.
+        assert_eq!(model_arg_partial("/clear "), None);
+        assert_eq!(model_arg_partial("/ "), None);
+        // Multi-token args dispatch directly, no suggestions.
+        assert_eq!(model_arg_partial("/model a b"), None);
+        assert_eq!(model_arg_partial("/model openai:x "), None);
+        // Lookalike prefixes must not trigger.
+        assert_eq!(model_arg_partial("/modelx"), None);
+        assert_eq!(model_arg_partial("/models x"), None);
+        assert_eq!(model_arg_partial("model "), None);
+        assert_eq!(model_arg_partial("/MODEL "), None);
+    }
+
+    #[test]
+    fn match_model_names_filters_full_combo_by_prefix_in_order() {
+        let names = vec![
+            "anthropic:claude-haiku-4-5".to_string(),
+            "anthropic:claude-sonnet-4-5".to_string(),
+            "openai:big-pickle".to_string(),
+        ];
+        assert_eq!(
+            match_model_names(&names, ""),
+            names,
+            "empty lists everything"
+        );
+        assert_eq!(
+            match_model_names(&names, "an"),
+            vec![
+                "anthropic:claude-haiku-4-5".to_string(),
+                "anthropic:claude-sonnet-4-5".to_string(),
+            ]
+        );
+        assert_eq!(
+            match_model_names(&names, "openai:"),
+            vec!["openai:big-pickle".to_string()]
+        );
+        // Substring mid-combo does not match (prefix semantics like themes).
+        assert!(match_model_names(&names, "haiku").is_empty());
+        assert!(match_model_names(&names, "xyz").is_empty());
+        assert!(match_model_names(&names, "AN").is_empty(), "case-sensitive");
     }
 
     #[test]
@@ -5830,6 +6592,71 @@ mod tests {
         async fn chat(&self, prompt: &str) -> Result<String, String> {
             *LAST_PROMPT.lock().unwrap() = prompt.to_string();
             Ok(String::new())
+        }
+    }
+
+    /// Stub with canned provider/model state for `/model` + `/effort`
+    /// dispatch tests: tracks a live tag + effort behind a mutex.
+    struct ModelStubAgent {
+        state: std::sync::Mutex<(String, String)>,
+    }
+
+    impl ModelStubAgent {
+        fn new() -> Self {
+            Self {
+                state: std::sync::Mutex::new(("openai:gpt-4o".to_string(), "medium".to_string())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentLoop for ModelStubAgent {
+        async fn chat(&self, _prompt: &str) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn context_stats_sync(&self) -> crate::context::ContextStats {
+            crate::context::ContextStats {
+                messages: 7,
+                chars: 1234,
+                trigger: 100,
+                keep: 40,
+                summarized: false,
+            }
+        }
+        fn switch_model_sync(&self, spec: &str) -> Result<String, String> {
+            let spec = spec.trim();
+            if spec.is_empty() {
+                return Err("usage: /model [provider:]<name>".to_string());
+            }
+            if spec == "nope:model" {
+                return Err("unknown provider \"nope\"".to_string());
+            }
+            let tag = match spec.contains(':') {
+                true => spec.to_string(),
+                false => format!("openai:{spec}"),
+            };
+            self.state.lock().unwrap().0 = tag.clone();
+            Ok(tag)
+        }
+        fn set_effort_sync(&self, level: &str) -> Result<String, String> {
+            let level = match level.trim() {
+                "low" | "high" => level.trim().to_string(),
+                _ => "medium".to_string(),
+            };
+            self.state.lock().unwrap().1 = level.clone();
+            Ok(level)
+        }
+        fn list_models(&self) -> Vec<String> {
+            vec![
+                "anthropic:claude-sonnet-4-5".to_string(),
+                self.state.lock().unwrap().0.clone(),
+            ]
+        }
+        fn model_name(&self) -> String {
+            self.state.lock().unwrap().0.clone()
+        }
+        fn effort_name(&self) -> String {
+            self.state.lock().unwrap().1.clone()
         }
     }
 
