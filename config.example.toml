@@ -1,14 +1,31 @@
 # rem example configuration
 # Copy to ~/.config/rem/config.toml and fill in real values.
 # Never commit your real config.
+#
+# Keys use env:VAR indirection only — the literal secret never sits here.
+# Set the env vars before launching, e.g.:
+#   export OPENAI_API_KEY="sk-..." ANTHROPIC_API_KEY="sk-ant-..."
 
-[api]
-key = "sk-your-key-here"
-base_url = "https://api.example.com/v1"
+# Which [providers.*] entry is live at startup. Switch mid-session with
+# `/model <provider>:<name>`; see README for details.
+active_provider = "openai"
 
-[model]
-default = "gpt-4o"
+# Unified reasoning effort: low / medium / high. Session-local override via
+# `/effort`. Mapped per provider internally (reasoning_effort vs thinking
+# budget). Defaults to medium when unset.
 effort = "medium"
+
+[providers.openai]
+type = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+key = "env:OPENAI_API_KEY"
+default_model = "gpt-4o"
+
+[providers.anthropic]
+type = "anthropic"
+# base_url optional — defaults to https://api.anthropic.com when omitted.
+key = "env:ANTHROPIC_API_KEY"
+default_model = "claude-sonnet-4-5"
 
 # Active color theme: names a file in ~/.config/rem/themes/
 # (e.g. theme = "gruvbox" loads ~/.config/rem/themes/gruvbox.toml).

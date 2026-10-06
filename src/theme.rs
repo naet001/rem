@@ -134,7 +134,7 @@ fn opt_color(s: Option<&str>, fallback: Color) -> Color {
 
 /// Insert or replace the top-level `theme = "<name>"` line in the raw
 /// `config.toml` text. Every other line passes through untouched, so
-/// comments and the `[api]` / `[model]` blocks survive a `/theme` switch.
+/// comments and the provider blocks survive a `/theme` switch.
 fn upsert_theme_line(existing: &str, name: &str) -> String {
     let replacement = format!("theme = \"{name}\"");
     let mut replaced = false;
@@ -384,27 +384,36 @@ blockquote_fg = "#928374"
     }
 
     #[test]
-    fn upsert_theme_line_preserves_api_and_model() {
-        let existing = "# my config\n\n[api]\nkey = \"sk-x\"\nbase_url = \"https://x\"\n\n[model]\ndefault = \"m\"\neffort = \"high\"\n";
+    fn upsert_theme_line_preserves_providers_and_effort() {
+        let existing = "# my config\n\nactive_provider = \"openai\"\neffort = \"high\"\n\n[providers.openai]\ntype = \"openai-compatible\"\nbase_url = \"https://x\"\nkey = \"env:REM_TEST_X\"\ndefault_model = \"m\"\n";
         let out = upsert_theme_line(existing, "gruvbox");
         assert!(
             out.contains("theme = \"gruvbox\""),
             "theme line missing: {out}"
         );
-        assert!(out.contains("[api]"), "api block lost: {out}");
-        assert!(out.contains("key = \"sk-x\""), "api key lost: {out}");
-        assert!(out.contains("[model]"), "model block lost: {out}");
+        assert!(
+            out.contains("[providers.openai]"),
+            "provider block lost: {out}"
+        );
+        assert!(
+            out.contains("key = \"env:REM_TEST_X\""),
+            "provider key lost: {out}"
+        );
+        assert!(
+            out.contains("active_provider"),
+            "active pointer lost: {out}"
+        );
         assert!(out.contains("# my config"), "comment lost: {out}");
         // The result must still parse as a full Config.
         let cfg: crate::config::Config = toml::from_str(&out).unwrap();
         assert_eq!(cfg.theme.name.as_deref(), Some("gruvbox"));
-        assert_eq!(cfg.api.key, "sk-x");
-        assert_eq!(cfg.model.effort, "high");
+        assert_eq!(cfg.providers["openai"].key, "env:REM_TEST_X");
+        assert_eq!(cfg.effort, "high");
     }
 
     #[test]
     fn upsert_theme_line_replaces_existing() {
-        let existing = "theme = \"old\"\n\n[api]\nkey = \"k\"\n";
+        let existing = "theme = \"old\"\n\nactive_provider = \"openai\"\n\n[providers.openai]\ntype = \"openai-compatible\"\nbase_url = \"https://x\"\nkey = \"env:REM_TEST_X\"\ndefault_model = \"m\"\n";
         let out = upsert_theme_line(existing, "new");
         assert_eq!(
             out.matches("theme =").count(),
@@ -412,7 +421,10 @@ blockquote_fg = "#928374"
             "duplicate theme lines: {out}"
         );
         assert!(out.contains("theme = \"new\""), "not replaced: {out}");
-        assert!(out.contains("[api]"), "api block lost: {out}");
+        assert!(
+            out.contains("[providers.openai]"),
+            "provider block lost: {out}"
+        );
     }
 
     #[test]

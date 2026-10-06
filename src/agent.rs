@@ -10,11 +10,11 @@ use rig::{
     client::CompletionClient,
     completion::{Chat, Prompt},
     message::{AssistantContent, ToolChoice},
-    providers::openai,
+    providers::{anthropic, openai},
 };
 
 use crate::{
-    config::Config,
+    config::{Config, ProviderKind},
     context::Context,
     modes::Mode,
     permissions::{ApprovalTx, PermissionHook},
@@ -68,6 +68,29 @@ pub trait AgentLoop {
     /// Returns human summary (`reloaded N skills: a, b`). Default: unsupported.
     fn reload_skills_sync(&self) -> Result<String, String> {
         Err("not supported".to_string())
+    }
+    /// Switch the active provider/model mid-Session. `spec` is `model`
+    /// (same provider) or `provider:model` (cross provider). Preserves
+    /// caller-owned history; returns the new `provider:model` tag.
+    /// Default: unsupported. Caller (TUI) must refuse while busy.
+    fn switch_model_sync(&self, _spec: &str) -> Result<String, String> {
+        Err("not supported".to_string())
+    }
+    /// Set the session-local reasoning effort (`low`/`medium`/`high`).
+    /// Returns the normalized level. Default: unsupported.
+    fn set_effort_sync(&self, _level: &str) -> Result<String, String> {
+        Err("not supported".to_string())
+    }
+    /// All configured `provider:model` combos for `/model` listing.
+    /// Default: none.
+    fn list_models(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Local usage snapshot for `/context`: message count, char estimate,
+    /// compaction trigger + keep window, summary presence. No token API.
+    /// Default: zeros. Lock failures report zeros, never block.
+    fn context_stats_sync(&self) -> crate::context::ContextStats {
+        crate::context::ContextStats::default()
     }
     // Trait surface for alternate `AgentLoop` impls; `RigAgent` overrides it.
     #[allow(dead_code)]
@@ -244,8 +267,10 @@ pub struct RigAgent {
     inner: tokio::sync::RwLock<rig::agent::Agent>,
     context: tokio::sync::Mutex<Context>,
     recorder: ToolRecorder,
-    model_name: String,
-    effort: String,
+    /// Active provider + model + effort, mutated live by `/model` and
+    /// `/effort`. Interior-mutable (same `Arc<Mutex>` shape as `mode`)
+    /// so the sync TUI path can switch through `&self`.
+    switch_state: Arc<Mutex<SwitchState>>,
     mode: Arc<Mutex<Mode>>,
     // Rebuild inputs for `/skills reload`: the inner `Agent` is frozen at
     // build time, so reload re-runs `build_inner` with a fresh skill scan.
@@ -255,10 +280,122 @@ pub struct RigAgent {
     skills: Arc<Mutex<Vec<crate::skills::Skill>>>,
 }
 
+/// Live provider/model/effort selection for one `RigAgent`.
+/// Session-local: `/model` mutates provider + model, `/effort` mutates
+/// effort. The stored `Config` keeps canonical entries; this keeps the
+/// live pointer.
+#[derive(Debug, Clone)]
+struct SwitchState {
+    provider: String,
+    model: String,
+    effort: String,
+}
+
+impl SwitchState {
+    fn tag(&self) -> String {
+        format!("{}:{}", self.provider, self.model)
+    }
+}
+
 /// Project instructions file name, loaded from the project root only.
 const AGENTS_MD: &str = "AGENTS.md";
 /// Header separating static instructions from project context in the preamble.
 const AGENTS_MD_HEADER: &str = "\n\nProject context from AGENTS.md:\n";
+
+/// Normalize a user-facing effort level to `low` / `medium` / `high`.
+/// Unset or unrecognized values fall back to `medium`.
+pub fn normalize_effort(raw: &str) -> &str {
+    match raw {
+        "low" | "high" => raw,
+        _ => "medium",
+    }
+}
+
+/// Unified effort → Anthropic thinking budget + required max tokens.
+/// Returns `(budget_tokens, max_tokens)`; max always exceeds budget.
+pub fn anthropic_budget(effort: &str) -> (u64, u64) {
+    match effort {
+        "low" => (1024, 4096),
+        "high" => (8192, 16384),
+        _ => (4096, 8192),
+    }
+}
+
+/// Fixed retry budget for transient provider failures (ticket 03).
+const MAX_RETRY_ATTEMPTS: u32 = 3;
+/// Backoff schedule: exponential from a 500ms base, `2^attempt * base`.
+fn retry_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(500 * 2u64.pow(attempt))
+}
+
+/// Run `op` with fixed retry on transient failures: up to
+/// [`MAX_RETRY_ATTEMPTS`] attempts with [`retry_delay`] backoff between
+/// attempts 1..N. Non-retryable errors return immediately. The sleep is
+/// the real contract (tests pay ~1.5s on the retry paths).
+async fn with_retry<T, F, Fut>(mut op: F) -> Result<T, String>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut attempt = 0;
+    loop {
+        match op(attempt).await {
+            Ok(v) => return Ok(v),
+            Err(e) if !is_retryable_error(&e) => return Err(e),
+            Err(e) if attempt + 1 >= MAX_RETRY_ATTEMPTS => return Err(e),
+            Err(_) => {
+                tokio::time::sleep(retry_delay(attempt)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// True when a stringified provider error looks transient: rate limits,
+/// 5xx server failures, timeouts, and dropped connections. Everything
+/// else (auth, bad request, unknown model) fails fast without retry.
+fn is_retryable_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("429")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("too many requests")
+        || lower.contains("500")
+        || lower.contains("502")
+        || lower.contains("503")
+        || lower.contains("504")
+        || lower.contains("internal server error")
+        || lower.contains("service unavailable")
+        || lower.contains("bad gateway")
+        || lower.contains("gateway timeout")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("connection aborted")
+        || lower.contains("temporarily unavailable")
+}
+
+/// Stage a config pointed at one provider/model target: clone the stored
+/// config, move the active pointer, and override that entry's default
+/// model. Shared by startup, `/model`, `/effort`, and `/skills reload`
+/// so key/endpoint/params always resolve identically.
+fn staged_config(
+    cfg: &Config,
+    provider: &str,
+    model: &str,
+    effort: &str,
+) -> Result<Config, String> {
+    let mut staged = cfg.clone();
+    staged.active_provider = provider.to_string();
+    staged.effort = effort.to_string();
+    staged
+        .providers
+        .get_mut(provider)
+        .map(|entry| entry.default_model = model.to_string())
+        .ok_or_else(|| format!("unknown provider \"{provider}\""))?;
+    Ok(staged)
+}
 
 /// Load project-root `AGENTS.md` verbatim. No cap, no transform.
 /// Returns `None` when missing/unreadable (caller silently skips).
@@ -278,14 +415,22 @@ impl RigAgent {
         let gate = PermissionHook::new(approval_tx, project_root.clone(), mode.clone());
         let skills = crate::skills::discover(&project_root);
 
-        let agent = Self::build_inner(cfg, &gate, &recorder, &project_root, &skills)?;
+        let resolved = cfg.active()?;
+        let effort = normalize_effort(&cfg.effort).to_string();
+        // Resolve + validate the startup target before building so a bad
+        // key/endpoint fails here, not inside the builder.
+        let staged = staged_config(cfg, &resolved.name, &resolved.model, &effort)?;
+        let agent = Self::build_inner(&staged, &effort, &gate, &recorder, &project_root, &skills)?;
 
         Ok(Self {
             inner: tokio::sync::RwLock::new(agent),
             context: tokio::sync::Mutex::new(Context::new()),
             recorder,
-            model_name: cfg.model.default.clone(),
-            effort: cfg.model.effort.clone(),
+            switch_state: Arc::new(Mutex::new(SwitchState {
+                provider: resolved.name,
+                model: resolved.model,
+                effort,
+            })),
             mode,
             cfg: cfg.clone(),
             project_root,
@@ -296,22 +441,67 @@ impl RigAgent {
 
     /// Build the inner `rig::agent::Agent`: client + preamble (static +
     /// AGENTS.md + skills index) + 11 tools + hooks. Pure constructor —
-    /// called at startup and on `/skills reload`.
+    /// called at startup, on `/skills reload`, and on `/model` switches.
+    /// Branches on the active provider entry: OpenAI-compatible legs keep
+    /// chat-completions semantics, Anthropic legs use the native Messages
+    /// client with a unified-effort thinking budget.
+    /// `effective` is the staged config (active pointer + default model
+    /// already pointed at the target); `effort` is the session-local level.
     fn build_inner(
-        cfg: &Config,
+        effective: &Config,
+        effort: &str,
         gate: &PermissionHook,
         recorder: &ToolRecorder,
         project_root: &std::path::Path,
         skills: &[crate::skills::Skill],
     ) -> Result<rig::agent::Agent, String> {
-        // Explicit `.base_url()` per spec — no reliance on OPENAI_BASE_URL env.
-        let client = openai::CompletionsClient::builder()
-            .api_key(cfg.api.key.clone())
-            .base_url(cfg.api.base_url.clone())
-            .build()
-            .map_err(|e| format!("failed to build LLM client: {e}"))?;
+        let resolved = effective.active()?;
+        let effort = normalize_effort(effort);
 
-        let model = client.completion_model(cfg.model.default.clone());
+        // Type-erased model handle: `Agent` carries no provider type
+        // parameter, so switching providers is just a rebuild.
+        let handle: rig::agent::ModelHandle = match resolved.kind {
+            ProviderKind::OpenAICompatible => {
+                let base_url = resolved.base_url.clone().ok_or_else(|| {
+                    format!(
+                        "provider \"{}\" type openai-compatible requires base_url",
+                        resolved.name
+                    )
+                })?;
+                // Explicit `.base_url()` per spec — no reliance on OPENAI_BASE_URL env.
+                let client = openai::CompletionsClient::builder()
+                    .api_key(resolved.key.clone())
+                    .base_url(base_url)
+                    .build()
+                    .map_err(|e| format!("failed to build LLM client: {e}"))?;
+                rig::agent::ModelHandle::new(client.completion_model(resolved.model.clone()))
+            }
+            ProviderKind::Anthropic => {
+                let base_url = resolved
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+                let client = anthropic::Client::builder()
+                    .api_key(resolved.key.clone())
+                    .base_url(base_url)
+                    .build()
+                    .map_err(|e| format!("failed to build LLM client: {e}"))?;
+                rig::agent::ModelHandle::new(client.completion_model(resolved.model.clone()))
+            }
+        };
+
+        let additional_params = match resolved.kind {
+            ProviderKind::OpenAICompatible => {
+                serde_json::json!({"reasoning_effort": effort})
+            }
+            ProviderKind::Anthropic => {
+                let (budget, max_tokens) = anthropic_budget(effort);
+                serde_json::json!({
+                    "thinking": {"type": "enabled", "budget_tokens": budget},
+                    "max_tokens": max_tokens,
+                })
+            }
+        };
 
         let mut preamble = String::from(
             "You are rem, a coding agent in a terminal TUI. \
@@ -332,7 +522,7 @@ impl RigAgent {
             preamble.push_str(&crate::skills::preamble_section(skills));
         }
 
-        let agent = AgentBuilder::new(model)
+        let agent = AgentBuilder::from_model_handle(handle)
             .preamble(&preamble)
             .tool(ReadTool)
             .tool(WriteTool)
@@ -346,12 +536,21 @@ impl RigAgent {
             .tool(WebFetchTool)
             .tool(WebSearchTool)
             .default_max_turns(100)
-            .additional_params(serde_json::json!({"reasoning_effort": cfg.model.effort.clone()}))
+            .additional_params(additional_params)
             .add_hook(recorder.clone())
             .add_hook(gate.clone())
             .build();
 
         Ok(agent)
+    }
+
+    /// Provider-qualified tag for the footer and Session record
+    /// (`provider:model`).
+    pub fn provider_tag(&self) -> String {
+        self.switch_state
+            .lock()
+            .map(|s| s.tag())
+            .unwrap_or_else(|_| "model".to_string())
     }
 
     // Wired up by upcoming session-title work (`generate_title` has a TODO
@@ -384,8 +583,9 @@ impl AgentLoop for RigAgent {
 
         // Lock once for the whole turn: history mutation + compaction are atomic
         // w.r.t. other chat() calls. The TUI serializes turns anyway.
-        let mut ctx = self.context.lock().await;
+        let ctx = self.context.lock().await;
         let before = ctx.len();
+        drop(ctx);
 
         // Fresh per-turn tool + reasoning logs: the hooks append as the turn runs.
         if let Ok(mut guard) = self.recorder.events.lock() {
@@ -395,15 +595,31 @@ impl AgentLoop for RigAgent {
             guard.clear();
         }
 
-        // Read-lock the inner agent for the turn. Safe: hooks never lock
-        // `inner` or `context`, so no lock cycle with `ctx` held.
-        let inner = self.inner.read().await;
-        let reply = Chat::chat(&*inner, prompt, ctx.messages_mut())
-            .await
-            .map_err(|e| e.to_string())?;
-        drop(inner);
+        // Transient provider failures (429/5xx/timeout) retry with backoff;
+        // the final error is labeled with the active provider tag.
+        // The context lock is per-attempt rather than per-turn: turns are
+        // serialized by the TUI, so no other chat() can interleave between
+        // attempts. Shared refs are copied out front so the retry closures
+        // own everything their futures need (no borrows escape the loop).
+        let tag = self.provider_tag();
+        let prompt_owned: String = prompt.to_owned();
+        let inner_lock = &self.inner;
+        let ctx_lock = &self.context;
+        let reply = with_retry(move |_| {
+            let p = prompt_owned.clone();
+            async move {
+                let inner = inner_lock.read().await;
+                let mut ctx = ctx_lock.lock().await;
+                Chat::chat(&*inner, p, ctx.messages_mut())
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        })
+        .await
+        .map_err(|e| format!("{tag}: {e}"))?;
 
         // Truncate newly committed tool outputs so they don't eat the window.
+        let mut ctx = self.context.lock().await;
         ctx.truncate_new(before);
 
         // Compact past the trigger: summarize oldest, keep newest verbatim.
@@ -411,15 +627,24 @@ impl AgentLoop for RigAgent {
             let material = Context::render_for_summary(&drained);
             // Summarize WITHOUT tools and WITHOUT history: a plain one-shot
             // call so the summary can't recurse into compaction or tool loops.
-            match self
-                .inner
-                .read()
-                .await
-                .prompt(material)
-                .preamble(SUMMARIZER_PROMPT)
-                .tool_choice(ToolChoice::None)
-                .await
-            {
+            // Same retry contract as the Run call; unrecoverable failure
+            // restores history instead of dropping it.
+            let inner_lock = &self.inner;
+            let summary = with_retry(move |_| {
+                let m = material.clone();
+                async move {
+                    inner_lock
+                        .read()
+                        .await
+                        .prompt(m)
+                        .preamble(SUMMARIZER_PROMPT)
+                        .tool_choice(ToolChoice::None)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            })
+            .await;
+            match summary {
                 Ok(summary) => ctx.apply_summary(summary),
                 Err(e) => {
                     // Summarizer failed: put the drained messages back instead
@@ -452,11 +677,14 @@ impl AgentLoop for RigAgent {
     }
 
     fn model_name(&self) -> String {
-        self.model_name.clone()
+        self.provider_tag()
     }
 
     fn effort_name(&self) -> String {
-        self.effort.clone()
+        self.switch_state
+            .lock()
+            .map(|s| s.effort.clone())
+            .unwrap_or_else(|_| "medium".to_string())
     }
     fn mode_handle(&self) -> Arc<Mutex<Mode>> {
         self.mode.clone()
@@ -510,13 +738,22 @@ impl AgentLoop for RigAgent {
             .map(|s| s.body.clone())
     }
     /// Re-scan skill dirs + rebuild the inner `Agent` so subsequent turns see
-    /// new/edited skills. History (`Context`), recorder, gate allows, and mode
-    /// survive (same Arcs reused). Fail-closed: rebuild error keeps old agent.
+    /// new/edited skills. History (`Context`), recorder, gate allows, mode,
+    /// and switch state survive (same Arcs reused). Fail-closed: rebuild
+    /// error keeps old agent.
     /// Caller (TUI) must refuse while a turn is in-flight (`app.busy`).
     fn reload_skills_sync(&self) -> Result<String, String> {
         let fresh = crate::skills::discover(&self.project_root);
+        let state = self
+            .switch_state
+            .lock()
+            .map_err(|_| "agent busy, try again".to_string())?;
+        let staged = staged_config(&self.cfg, &state.provider, &state.model, &state.effort)?;
+        let effort = state.effort.clone();
+        drop(state);
         let rebuilt = Self::build_inner(
-            &self.cfg,
+            &staged,
+            &effort,
             &self.gate,
             &self.recorder,
             &self.project_root,
@@ -542,11 +779,383 @@ impl AgentLoop for RigAgent {
             )),
         }
     }
+
+    /// Switch the active provider/model mid-Session. `spec` is `model`
+    /// (same provider) or `provider:model` (cross provider). Rebuilds the
+    /// inner `Agent` reusing the Gate, recorder, mode, and skills;
+    /// caller-owned history is preserved. Fail-closed: rebuild errors keep
+    /// the old agent. Refuses empty specs and unknown providers.
+    /// Returns the new `provider:model` tag.
+    /// Caller (TUI) must refuse while a turn is in-flight (`app.busy`).
+    fn switch_model_sync(&self, spec: &str) -> Result<String, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("usage: /model [provider:]<name>".to_string());
+        }
+        // Snapshot the live pointer once; the commit below is atomic.
+        let (cur_provider, cur_effort) = {
+            let state = self
+                .switch_state
+                .lock()
+                .map_err(|_| "agent busy, try again".to_string())?;
+            (state.provider.clone(), state.effort.clone())
+        };
+        let (provider, model) = match spec.split_once(':') {
+            Some((p, m)) if !p.trim().is_empty() && !m.trim().is_empty() => {
+                (p.trim().to_string(), m.trim().to_string())
+            }
+            _ => (cur_provider, spec.to_string()),
+        };
+        if !self.cfg.providers.contains_key(&provider) {
+            return Err(format!("unknown provider \"{provider}\""));
+        }
+        // Stage through the shared startup path so key/endpoint/params
+        // resolve identically. Resolve eagerly: a bad key fails before the
+        // old agent is touched.
+        let staged = staged_config(&self.cfg, &provider, &model, &cur_effort)?;
+        staged.active()?;
+        let skills_snapshot = self
+            .skills
+            .lock()
+            .map(|g| g.clone())
+            .map_err(|_| "agent busy, try again".to_string())?;
+        let rebuilt = Self::build_inner(
+            &staged,
+            &cur_effort,
+            &self.gate,
+            &self.recorder,
+            &self.project_root,
+            &skills_snapshot,
+        )?;
+        match self.inner.try_write() {
+            Ok(mut guard) => {
+                *guard = rebuilt;
+            }
+            Err(_) => return Err("agent busy, try again".to_string()),
+        }
+        let mut state = self
+            .switch_state
+            .lock()
+            .map_err(|_| "agent busy, try again".to_string())?;
+        state.provider = provider;
+        state.model = model;
+        Ok(state.tag())
+    }
+
+    /// Set the session-local reasoning effort. Accepts `low`/`medium`/`high`
+    /// (anything else normalizes to `medium`), rebuilds request params for
+    /// the active provider, preserves history. Returns the normalized level.
+    /// Caller (TUI) must refuse while a turn is in-flight (`app.busy`).
+    fn set_effort_sync(&self, level: &str) -> Result<String, String> {
+        let effort = normalize_effort(level.trim()).to_string();
+        let (provider, model) = {
+            let state = self
+                .switch_state
+                .lock()
+                .map_err(|_| "agent busy, try again".to_string())?;
+            (state.provider.clone(), state.model.clone())
+        };
+        let staged = staged_config(&self.cfg, &provider, &model, &effort)?;
+        staged.active()?;
+        let skills_snapshot = self
+            .skills
+            .lock()
+            .map(|g| g.clone())
+            .map_err(|_| "agent busy, try again".to_string())?;
+        let rebuilt = Self::build_inner(
+            &staged,
+            &effort,
+            &self.gate,
+            &self.recorder,
+            &self.project_root,
+            &skills_snapshot,
+        )?;
+        match self.inner.try_write() {
+            Ok(mut guard) => {
+                *guard = rebuilt;
+            }
+            Err(_) => return Err("agent busy, try again".to_string()),
+        }
+        if let Ok(mut state) = self.switch_state.lock() {
+            state.effort = effort.clone();
+        }
+        Ok(effort)
+    }
+
+    /// All configured `provider:model` combos for `/model` listing.
+    /// The active provider shows its live model; the rest show defaults.
+    fn list_models(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.cfg.providers.keys().cloned().collect();
+        names.sort();
+        let live = self.switch_state.lock().ok().map(|s| s.clone());
+        names
+            .into_iter()
+            .map(|provider| {
+                let model = match &live {
+                    Some(s) if s.provider == provider => s.model.clone(),
+                    _ => self
+                        .cfg
+                        .providers
+                        .get(&provider)
+                        .map(|e| e.default_model.clone())
+                        .unwrap_or_default(),
+                };
+                format!("{provider}:{model}")
+            })
+            .collect()
+    }
+
+    /// Local usage snapshot for `/context`, read off the caller-owned
+    /// history. Lock contention reports zeros rather than blocking.
+    fn context_stats_sync(&self) -> crate::context::ContextStats {
+        match self.context.try_lock() {
+            Ok(g) => g.stats(),
+            Err(_) => crate::context::ContextStats::default(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limit_and_server_errors_are_retryable() {
+        // Independent literals: the contract, not the implementation.
+        assert!(is_retryable_error("429 Too Many Requests"));
+        assert!(is_retryable_error("rate limit exceeded, retry later"));
+        assert!(is_retryable_error("503 Service Unavailable"));
+        assert!(is_retryable_error("500 Internal Server Error"));
+        assert!(is_retryable_error("request timed out after 30s"));
+        assert!(is_retryable_error("connection reset by peer"));
+    }
+
+    #[test]
+    fn auth_and_client_errors_are_not_retryable() {
+        assert!(!is_retryable_error("401 Unauthorized: invalid API key"));
+        assert!(!is_retryable_error("400 Bad Request: unknown model"));
+        assert!(!is_retryable_error(
+            "context compaction failed, history restored: boom"
+        ));
+    }
+
+    #[test]
+    fn backoff_schedule_grows_per_attempt_with_fixed_attempt_count() {
+        // Independent literals from the ticket-03 contract: 3 attempts,
+        // exponential backoff from a 500ms base.
+        assert_eq!(MAX_RETRY_ATTEMPTS, 3);
+        assert_eq!(retry_delay(0), std::time::Duration::from_millis(500));
+        assert_eq!(retry_delay(1), std::time::Duration::from_millis(1000));
+        assert_eq!(retry_delay(2), std::time::Duration::from_millis(2000));
+    }
+
+    #[tokio::test]
+    async fn transient_failures_retry_then_succeed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let out = with_retry(|_| async {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            match n < 2 {
+                true => Err::<&str, String>("503 Service Unavailable".to_string()),
+                false => Ok("done"),
+            }
+        })
+        .await;
+        assert_eq!(out, Ok("done"));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn persistent_transient_failure_returns_last_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let out = with_retry(|_| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<&str, String>("429 Too Many Requests".to_string())
+        })
+        .await;
+        assert_eq!(out, Err("429 Too Many Requests".to_string()));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_error_fails_fast_without_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let out = with_retry(|_| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<&str, String>("401 Unauthorized".to_string())
+        })
+        .await;
+        assert_eq!(out, Err("401 Unauthorized".to_string()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn effort_mapping_keeps_unified_scale_across_providers() {
+        // Independent literals from the ticket-02 effort table.
+        assert_eq!(normalize_effort("low"), "low");
+        assert_eq!(normalize_effort("medium"), "medium");
+        assert_eq!(normalize_effort("high"), "high");
+        assert_eq!(normalize_effort(""), "medium");
+        assert_eq!(normalize_effort("ultra"), "medium");
+    }
+
+    #[test]
+    fn anthropic_budget_grows_with_effort_and_max_exceeds_budget() {
+        let (low_budget, low_max) = anthropic_budget("low");
+        let (med_budget, med_max) = anthropic_budget("medium");
+        let (high_budget, high_max) = anthropic_budget("high");
+        assert!(low_budget < med_budget && med_budget < high_budget);
+        for (budget, max) in [
+            (low_budget, low_max),
+            (med_budget, med_max),
+            (high_budget, high_max),
+        ] {
+            assert!(max > budget, "max {max} must exceed budget {budget}");
+        }
+    }
+
+    fn test_config() -> Config {
+        toml::from_str(
+            r#"
+active_provider = "openai"
+effort = "medium"
+
+[providers.openai]
+type = "openai-compatible"
+base_url = "https://api.example.com/v1"
+key = "env:REM_TEST_SWITCH_OPENAI"
+default_model = "gpt-4o"
+
+[providers.anthropic]
+type = "anthropic"
+key = "env:REM_TEST_SWITCH_ANTHROPIC"
+default_model = "claude-sonnet-4-5"
+"#,
+        )
+        .unwrap()
+    }
+
+    fn test_agent() -> RigAgent {
+        // SAFETY: test-only env mutation; all switch tests set the same
+        // values, and rebuilds re-resolve keys on every switch/effort call,
+        // so the vars stay set for the test process lifetime.
+        unsafe {
+            std::env::set_var("REM_TEST_SWITCH_OPENAI", "sk-openai-test");
+            std::env::set_var("REM_TEST_SWITCH_ANTHROPIC", "sk-anthropic-test");
+        }
+        let dir = std::env::temp_dir().join("rem-test-switch-agent");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, _rx) = crate::permissions::approval_channel();
+        RigAgent::new(&test_config(), tx, dir).unwrap()
+    }
+
+    #[test]
+    fn switch_same_provider_updates_live_model_tag() {
+        let agent = test_agent();
+        assert_eq!(agent.model_name(), "openai:gpt-4o");
+        let tag = agent.switch_model_sync("gpt-4o-mini").unwrap();
+        assert_eq!(tag, "openai:gpt-4o-mini");
+        assert_eq!(agent.model_name(), "openai:gpt-4o-mini");
+    }
+
+    #[test]
+    fn switch_cross_provider_updates_tag() {
+        let agent = test_agent();
+        let tag = agent
+            .switch_model_sync("anthropic:claude-haiku-4-5")
+            .unwrap();
+        assert_eq!(tag, "anthropic:claude-haiku-4-5");
+        assert_eq!(agent.model_name(), "anthropic:claude-haiku-4-5");
+    }
+
+    #[test]
+    fn switch_unknown_provider_fails_without_touching_live_tag() {
+        let agent = test_agent();
+        let err = agent
+            .switch_model_sync("nope:model")
+            .expect_err("must fail");
+        assert!(err.contains("unknown provider"), "got: {err}");
+        assert_eq!(agent.model_name(), "openai:gpt-4o");
+    }
+
+    #[test]
+    fn switch_empty_spec_reports_usage_without_touching_live_tag() {
+        let agent = test_agent();
+        let err = agent.switch_model_sync("  ").expect_err("must fail");
+        assert!(err.contains("/model"), "got: {err}");
+        assert_eq!(agent.model_name(), "openai:gpt-4o");
+    }
+
+    #[test]
+    fn set_effort_rebuilds_and_returns_normalized_level() {
+        let agent = test_agent();
+        assert_eq!(agent.set_effort_sync("high").unwrap(), "high");
+        assert_eq!(agent.effort_name(), "high");
+        // Unrecognized levels normalize to medium.
+        assert_eq!(agent.set_effort_sync("ultra").unwrap(), "medium");
+        assert_eq!(agent.effort_name(), "medium");
+    }
+
+    #[test]
+    fn list_models_shows_live_model_for_active_provider() {
+        let agent = test_agent();
+        assert_eq!(
+            agent.list_models(),
+            vec![
+                "anthropic:claude-sonnet-4-5".to_string(),
+                "openai:gpt-4o".to_string(),
+            ]
+        );
+        agent.switch_model_sync("gpt-4o-mini").unwrap();
+        assert_eq!(
+            agent.list_models(),
+            vec![
+                "anthropic:claude-sonnet-4-5".to_string(),
+                "openai:gpt-4o-mini".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn context_stats_reflects_live_history() {
+        let agent = test_agent();
+        let stats = agent.context_stats_sync();
+        assert_eq!(stats.messages, 0);
+        assert_eq!(stats.trigger, crate::context::Context::TRIGGER);
+        agent
+            .import_sync(&crate::context::Context::new().to_json().unwrap())
+            .unwrap();
+        let mut ctx = crate::context::Context::new();
+        ctx.messages_mut()
+            .push(rig::message::Message::user("hello world"));
+        agent.import_sync(&ctx.to_json().unwrap()).unwrap();
+        let stats = agent.context_stats_sync();
+        assert_eq!(stats.messages, 1);
+        assert_eq!(stats.chars, "hello world".len());
+        assert!(!stats.summarized);
+    }
+
+    #[test]
+    fn switch_preserves_caller_owned_history() {
+        let agent = test_agent();
+        // Seed history through the public import surface.
+        let mut ctx = crate::context::Context::new();
+        ctx.messages_mut()
+            .push(rig::message::Message::user("remember the plan"));
+        let before = ctx.to_json().unwrap();
+        agent.import_sync(&before).unwrap();
+        // Switch provider and model; history must survive verbatim.
+        agent
+            .switch_model_sync("anthropic:claude-haiku-4-5")
+            .unwrap();
+        assert_eq!(agent.export_sync().unwrap(), before);
+        // Effort changes preserve history too.
+        agent.set_effort_sync("high").unwrap();
+        assert_eq!(agent.export_sync().unwrap(), before);
+    }
 
     #[test]
     fn load_agents_md_returns_none_when_missing() {

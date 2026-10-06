@@ -46,26 +46,32 @@ Approval gives you four moves: **Allow once / Allow always** (session rule scope
 
 ## Quickstart
 
-Requires Rust + an OpenAI-compatible endpoint.
+Requires Rust + an OpenAI-compatible endpoint and/or an Anthropic key.
 
 ```bash
 mkdir -p ~/.config/rem
 cp config.example.toml ~/.config/rem/config.toml
-# edit ~/.config/rem/config.toml: set [api] key + base_url, [model] default
+# edit ~/.config/rem/config.toml: set active_provider + [providers.*] entries;
+# export OPENAI_API_KEY / ANTHROPIC_API_KEY to match your key = "env:..." refs
 cargo run
 ```
 
 Minimal `~/.config/rem/config.toml`:
 
 ```toml
-[api]
-key = "sk-your-key-here"
-base_url = "https://api.example.com/v1"
+active_provider = "openai"
+effort = "medium"  # low / medium / high (unified, mapped per provider)
 
-[model]
-default = "gpt-4o"
-effort = "medium"  # low / medium / high -> reasoning_effort
+[providers.openai]
+type = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+key = "env:OPENAI_API_KEY"
+default_model = "gpt-4o"
 ```
+
+Add a `[providers.anthropic]` block (see `config.example.toml`) to use
+Claude too. Keys use `env:VAR` indirection only — literals are rejected.
+Switch live with `/model`, tune reasoning with `/effort`.
 
 Talk, approve when asked, quit with `/quit`. On exit `rem` prints `Session saved. Resume with: rem --resume <id>`.
 
@@ -85,6 +91,9 @@ Full reference — type `/` for the floating menu, `Up`/`Down` to move, `Tab` to
 | `/fork` | clone current history into a new session id, title reset |
 | `/skills [reload]` | list discovered skills; `/skills reload` re-scans + rebuilds so new skills work without restart |
 | `/skill:<name> [task]` | invoke a skill: body expands into the turn, transcript shows the short form. Up to 6 leading mentions stack; `$ARGUMENTS` passes the task text |
+| `/model [[provider:]name]` | bare lists `provider:model` combos; `/model <name>` switches within the active provider, `/model <provider>:<name>` switches providers. History preserved, footer + session tag updated |
+| `/effort [low\|medium\|high]` | bare shows the session level; with a level applies live to the active provider (session-local, config file untouched) |
+| `/context` | local usage: message count (~chars), compaction trigger/keep window, summary status. No token API |
 
 Keys: `Enter` submit, `Shift+Enter` or `Ctrl+O` newline, `Esc` interrupt a run (second `Esc` clears input), `Ctrl+C` clear, `Shift+Tab` cycle mode, `j/k`, `Up/Down`, `Ctrl+d/u` in popups.
 
@@ -98,10 +107,12 @@ At startup the preamble gets an index (`name — description — path + siblings
 
 ## Sessions (compact)
 
-Persisted per turn in SQLite (`sessions.db` under your platform data dir), keyed by literal canonicalized cwd. One row: `id, project_root, title, model, messages_json`.
+Persisted per turn in SQLite (`sessions.db` under your platform data dir), keyed by literal canonicalized cwd. One row: `id, project_root, title, model, messages_json`. The `model` column stores the `provider:model` tag.
 
 - `rem --resume <id>` restarts anywhere; unknown ids exit non-zero
 - `/resume` picker filters to the current project; `/fork` copies history verbatim
+- Resume restores the stored tag: `/resume <id>` and the picker switch the live client when it differs (unknown tags warn and keep the current client + history)
+- `/model` persists the new tag per switch; autosave keeps history + title — failures surface, never silent
 - Titles fall back to the first user message (40 chars); autosave is synchronous — failures surface, never silent
 
 ## Themes (compact)

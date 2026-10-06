@@ -1,5 +1,19 @@
 use rig::message::{AssistantContent, Message, ToolResultContent, UserContent};
 
+/// Local usage snapshot for `/context`. Plain data, no Rig internals —
+/// the TUI renders it without touching message shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ContextStats {
+    pub messages: usize,
+    pub chars: usize,
+    pub trigger: usize,
+    pub keep: usize,
+    pub summarized: bool,
+}
+
+/// Marker prefix for compaction summaries (see `apply_summary`).
+const SUMMARY_PREFIX: &str = "Prior conversation summary:";
+
 /// Caller-owned conversation history with tool-output truncation and
 /// message-count compaction. In-memory only: dies with the process.
 ///
@@ -88,8 +102,59 @@ impl Context {
 
     /// Replace drained messages with a single summary at index 0.
     pub fn apply_summary(&mut self, summary: String) {
-        let entry = Message::user(format!("Prior conversation summary: {summary}"));
+        let entry = Message::user(format!("{SUMMARY_PREFIX} {summary}"));
         self.messages.insert(0, entry);
+    }
+
+    /// Local usage snapshot for `/context`: message count, estimated chars
+    /// across user/assistant text (tool results included), the compaction
+    /// trigger + keep window, and whether a summary is present.
+    pub fn stats(&self) -> ContextStats {
+        let mut chars = 0;
+        let mut summarized = false;
+        for m in &self.messages {
+            match m {
+                Message::System { content } => chars += content.chars().count(),
+                Message::User { content } => {
+                    for c in content {
+                        match c {
+                            UserContent::Text(t) => {
+                                if t.text.starts_with(SUMMARY_PREFIX) {
+                                    summarized = true;
+                                }
+                                chars += t.text.chars().count();
+                            }
+                            UserContent::ToolResult(r) => {
+                                for part in &r.content {
+                                    if let Some(text) = part.as_text() {
+                                        chars += text.chars().count();
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Message::Assistant { content, .. } => {
+                    for c in content {
+                        match c {
+                            AssistantContent::Text(t) => chars += t.text.chars().count(),
+                            AssistantContent::ToolCall(tc) => {
+                                chars += tc.function.name.chars().count();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        ContextStats {
+            messages: self.messages.len(),
+            chars,
+            trigger: Self::TRIGGER,
+            keep: Self::KEEP,
+            summarized,
+        }
     }
 
     /// Render drained messages as compact `role: text` lines for the summarizer.
@@ -153,6 +218,33 @@ mod tests {
                 content: vec![ToolResultContent::text(text)],
             })],
         }
+    }
+
+    #[test]
+    fn stats_reports_message_count_chars_and_summary_presence() {
+        let mut ctx = Context::new();
+        assert_eq!(
+            ctx.stats(),
+            ContextStats {
+                messages: 0,
+                chars: 0,
+                trigger: Context::TRIGGER,
+                keep: Context::KEEP,
+                summarized: false,
+            }
+        );
+        ctx.messages_mut().push(Message::user("hello world"));
+        ctx.messages_mut().push(tool_msg("abc"));
+        let stats = ctx.stats();
+        assert_eq!(stats.messages, 2);
+        assert_eq!(stats.chars, "hello world".len() + "abc".len());
+        assert_eq!(stats.trigger, Context::TRIGGER);
+        assert_eq!(stats.keep, Context::KEEP);
+        assert!(!stats.summarized);
+        ctx.apply_summary("did stuff".to_string());
+        let stats = ctx.stats();
+        assert_eq!(stats.messages, 3);
+        assert!(stats.summarized);
     }
 
     #[test]
