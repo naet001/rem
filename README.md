@@ -1,23 +1,32 @@
 # rem
 
-A terminal coding agent you can audit. Rust + Ratatui TUI, Rig agent loop, and a single permission gate that decides every tool call before it runs.
+A terminal coding agent built as a personal learning project. Rust + Ratatui TUI, Rig agent loop, and a single permission gate that decides every tool call before it runs.
 
-No per-tool bypasses. Policy is a pure function. Destructive patterns are denied outright — never prompted.
+## Purpose
 
-## Why rem
+`rem` is a simple harness for learning how coding agents are put together. It is not production software: expect rough edges, and read the safety story below as a study, not a guarantee.
 
-Most coding agents ask you to trust the loop. `rem` makes the loop inspectable:
+The project works through a few questions end to end:
+
+- How do you route every model tool call through one inspectable choke point instead of scattering checks through each tool?
+- How do you build a full-screen TUI — panes, popups, themes, keymaps — in Rust with Ratatui?
+- How do you run an agent loop (Rig) where an approval pauses the run mid-stream and resumes the same run?
+- How do sessions, skills, and config persist without any of it becoming privileged or magic?
+
+## Design notes
+
+The answers, as implemented:
 
 - **One choke point** — `PermissionHook::on_tool_call` (ADR-0001) classifies every call. Tools stay dumb.
 - **Pure policy** — `classify(tool, args, root) -> Allow | Confirm | Deny`. No I/O, fully unit-tested (ADR-0002).
 - **Interrupt, don't kill** — approvals park the worker mid-run over mpsc + oneshot, then resume the same run (ADR-0003).
 - **Modes are presets, not personas** — 5 hard-coded modes, session-local, auditable (ADR-0011).
 - **Reusable knowledge** — Claude-compatible `SKILL.md` bundles with startup index + on-demand bodies (ADR-0013).
-- **Decisions on record** — 16 ADRs in `docs/adr/`, 141 tests, `cargo test` green (minus 2 live web checks that need network).
+- **Decisions on record** — 18 ADRs in `docs/adr/`, 211 tests, `cargo test` green (minus 2 live web checks that need network).
 
 ## Permission verdicts
 
-The centerpiece. Three outcomes, no ambiguity:
+Three outcomes, no ambiguity:
 
 | Class | Tools / patterns | Default |
 |---|---|---|
@@ -74,6 +83,12 @@ Claude too. Keys use `env:VAR` indirection only — literals are rejected.
 Switch live with `/model`, tune reasoning with `/effort`.
 
 Talk, approve when asked, quit with `/quit`. On exit `rem` prints `Session saved. Resume with: rem --resume <id>`.
+
+```
+rem --help       # usage, config + session pointers (no TUI, no config needed)
+rem --version    # print version and exit
+rem --resume <id>  # resume a saved session
+```
 
 ## Slash commands
 
@@ -136,7 +151,7 @@ Project context: project-root `AGENTS.md` only (no walk-up, no global), appended
 
 ## Limits
 
-Explicit, because rigor without honesty is theater:
+Explicit, because a learning project should not oversell:
 
 - **Heuristic, not sandbox.** Bash classification is syntactic (`; && || | & $( )`, quote-stripping). No namespaces, seccomp, or kernel boundary. A determined prompt-injection can shape a command the parser misreads — the human is still the boundary.
 - **No secrets redaction.** Reads return file bytes verbatim in v1.
@@ -145,7 +160,7 @@ Explicit, because rigor without honesty is theater:
 
 ## Architecture & docs
 
-- `docs/adr/` — 0001 choke point, 0002 tiers, 0003 interrupt/resume, 0004–0005 Aster-style panes, 0006 keymap, 0007 slash menu, 0008 busy verbs, 0009 AGENTS.md + theme pattern, 0010 sessions + theme suggestions, 0011 modes + popups, 0012 vim navigation, 0013 skills
+- `docs/adr/` — 0001 choke point, 0002 tiers, 0003 interrupt/resume, 0004–0005 Aster-style panes, 0006 keymap, 0007 slash menu, 0008 busy verbs, 0009 AGENTS.md + theme pattern, 0010 sessions + theme suggestions, 0011 modes + popups, 0012 at-mentions + vim navigation, 0013 MCP client + skills
 - `docs/glossary.md` — Principal / Gate / Policy / Approver / Verdicts / Skills, the living source of truth
 - `docs/themes.md`, `docs/popup-test-matrix.md`
 
@@ -154,13 +169,14 @@ Hook order matters: recorder first (observe-all), gate second (steer). `Skip` ke
 ## Development
 
 ```bash
-cargo test   # 141 tests: policy units, hook round-trips, skills, TUI regressions + 2 live web checks (need network)
+cargo test            # offline-green: policy units, hook round-trips, skills, TUI regressions (live web checks ignored)
+cargo test -- --ignored  # opt-in: 2 live web checks (need network)
 cargo fmt --check
-cargo clippy --all-targets
+cargo clippy --all-targets -- -D warnings
 ```
 
 Tests live next to code (`permissions.rs`, `skills.rs`, `tui.rs`, `agent.rs`, `config.rs`, …). The classifier is pure — no I/O, no channels — so policy changes are test-first friendly.
 
 ## License
 
-Currently unlicensed unless otherwise specified.
+MIT — see `LICENSE`.

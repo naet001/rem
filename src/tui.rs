@@ -1639,7 +1639,8 @@ impl App {
     }
 
     /// Finish a completed turn: stream any tools the 80ms poll hasn't
-    /// forwarded yet, then the reply (or error), then the `Done` trailer.
+    /// forwarded yet, then — if the turn ran any tools — the divider rule,
+    /// then the reply (or error), then the `Done` trailer.
     /// `started` is the turn's `busy_since`; the trailer carries elapsed.
     fn finish_turn(
         &mut self,
@@ -1651,8 +1652,14 @@ impl App {
         for ev in events {
             self.stream_tool(ev);
         }
+        // Live-streamed rows count too: `streamed_tools` totals every tool
+        // observed this turn (reset at turn start and below).
+        let had_tools = self.streamed_tools > 0;
         match result {
             Ok(text) => {
+                if had_tools {
+                    self.enqueue(history::divider_row(w));
+                }
                 let body = match text.trim().is_empty() {
                     true => "(empty reply)",
                     false => text,
@@ -1683,6 +1690,9 @@ impl App {
         self.replay_messages(&msgs);
     }
     fn replay_messages(&mut self, msgs: &[Message]) {
+        // Tools printed since the last rendered reply: the divider rule
+        // goes above that reply, mirroring `finish_turn`.
+        let mut tools_since_reply = false;
         for m in msgs {
             match m {
                 Message::System { .. } => {}
@@ -1721,6 +1731,7 @@ impl App {
                     if !had_tool && !body.trim().is_empty() {
                         self.enqueue_user(&body);
                     }
+                    tools_since_reply |= had_tool;
                 }
                 Message::Assistant { content, .. } => {
                     let mut body = String::new();
@@ -1730,6 +1741,11 @@ impl App {
                         }
                     }
                     if !body.trim().is_empty() {
+                        if tools_since_reply {
+                            let w = self.term_width as usize;
+                            self.enqueue(crate::history::divider_row(w));
+                            tools_since_reply = false;
+                        }
                         let w = self.term_width as usize;
                         self.enqueue(crate::history::reply_rows(&body, w, &self.theme));
                     }
@@ -4666,9 +4682,10 @@ mod tests {
         let started = Instant::now() - Duration::from_millis(2200);
         let before = app.print_queue.len();
         app.finish_turn(&[ev("read"), ev("bash")], &Ok("done.".to_string()), started);
-        // Queued groups: both tools (final record with output) + reply +
-        // trailer. Live rows printed mid-turn stay as the in-progress record.
-        assert_eq!(app.print_queue.len(), before + 4);
+        // Queued groups: both tools (final record with output) + the divider
+        // rule + reply + trailer. Live rows printed mid-turn stay as the
+        // in-progress record.
+        assert_eq!(app.print_queue.len(), before + 5);
         let new_groups = &app.print_queue[before..];
         let flat: String = new_groups
             .iter()
@@ -4683,9 +4700,33 @@ mod tests {
             .join("\n");
         assert!(flat.contains("bash"), "got: {flat}");
         assert!(flat.contains("read"), "got: {flat}");
+        // The divider rule sits between the last tool row and the reply.
+        let rule = flat.find('─').expect("divider present");
+        assert!(rule < flat.find("done.").unwrap(), "rule before reply");
         assert!(flat.contains("done."), "got: {flat}");
         assert!(flat.contains("Done (2.2s · 2 tools)"), "got: {flat}");
         assert_eq!(app.streamed_tools, 0);
+    }
+
+    #[test]
+    fn finish_turn_without_tools_prints_no_divider() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.term_width = 80;
+        let before = app.print_queue.len();
+        app.finish_turn(&[], &Ok("plain.".to_string()), Instant::now());
+        // Just the reply group — no divider between nothing and the answer.
+        assert_eq!(app.print_queue.len(), before + 1);
+        let flat: String = app.print_queue[before]
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!flat.contains('─'), "got: {flat}");
     }
 
     #[test]

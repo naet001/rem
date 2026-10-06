@@ -16,8 +16,86 @@ use agent::{AgentLoop, RigAgent};
 use config::Config;
 use tui::{RatatuiBackend, TuiBackend};
 
+/// `rem --help` text: flags, config, sessions, in-TUI pointers.
+const HELP: &str = "rem \u{2014} a terminal coding agent you can audit.
+
+Usage:
+  rem                    start a new session (TUI)
+  rem --resume <id>      resume a saved session (TUI)
+  rem --help, -h         show this help and exit
+  rem --version, -V      show version and exit
+
+Config: ~/.config/rem/config.toml (see config.example.toml).
+  active_provider + [providers.*] entries; keys use env:VAR indirection \u{2014}
+  export OPENAI_API_KEY / ANTHROPIC_API_KEY to match.
+
+Sessions persist per turn in SQLite under your platform data dir; on exit
+rem prints `Session saved. Resume with: rem --resume <id>`.
+
+Inside the TUI: /quit /new /help /theme /init /resume /rename /fork
+/skills /skill:<name> /model /effort /context, Shift+Tab cycles modes,
+@path inlines file/dir contents. Docs: README.md, docs/adr/.";
+
+/// CLI shape: run (fresh or resume) vs immediate stdout actions.
+#[derive(Debug, PartialEq, Eq)]
+enum Cli {
+    Run { resume_id: Option<String> },
+    Help,
+    Version,
+}
+
+/// Parse `std::env::args` without new deps. `--help`/`--version` win over
+/// everything; unknown `--flags` are fatal; bare positionals are ignored
+/// (reserved for future subcommands like `exec`).
+fn parse_cli(args: &[String]) -> Result<Cli, String> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return Ok(Cli::Help);
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        return Ok(Cli::Version);
+    }
+    let mut resume_id: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--resume" => {
+                if i + 1 >= args.len() {
+                    return Err("--resume requires a session id".to_string());
+                }
+                resume_id = Some(args[i + 1].clone());
+                i += 2;
+            }
+            flag if flag.starts_with('-') => {
+                return Err(format!("unknown flag {flag} (see rem --help)"));
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    Ok(Cli::Run { resume_id })
+}
+
 #[tokio::main]
 async fn main() {
+    // Flags that never touch config, db, or the TUI.
+    let args: Vec<String> = std::env::args().collect();
+    let resume_id: Option<String> = match parse_cli(&args) {
+        Ok(Cli::Help) => {
+            println!("{HELP}");
+            return;
+        }
+        Ok(Cli::Version) => {
+            println!("rem {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Ok(Cli::Run { resume_id }) => resume_id,
+        Err(e) => {
+            eprintln!("rem: {e}");
+            std::process::exit(2);
+        }
+    };
+
     let cfg = match Config::from_file() {
         Ok(c) => c,
         Err(e) => {
@@ -28,23 +106,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-
-    // Manual --resume <id> parse (no new deps).
-    let args: Vec<String> = std::env::args().collect();
-    let mut resume_id: Option<String> = None;
-    let mut i = 1;
-    while i < args.len() {
-        if args[i] == "--resume" {
-            if i + 1 >= args.len() {
-                eprintln!("rem: --resume requires a session id");
-                std::process::exit(1);
-            }
-            resume_id = Some(args[i + 1].clone());
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let project_root = cwd.canonicalize().unwrap_or(cwd);
@@ -164,5 +225,64 @@ async fn main() {
     if let Err(e) = run_result {
         eprintln!("rem: TUI error: {e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        std::iter::once("rem".to_string())
+            .chain(words.iter().map(|w| w.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn bare_run_has_no_resume() {
+        assert_eq!(parse_cli(&argv(&[])), Ok(Cli::Run { resume_id: None }));
+    }
+
+    #[test]
+    fn resume_captures_id() {
+        assert_eq!(
+            parse_cli(&argv(&["--resume", "abc123"])),
+            Ok(Cli::Run {
+                resume_id: Some("abc123".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn resume_without_id_is_fatal() {
+        assert!(parse_cli(&argv(&["--resume"])).is_err());
+    }
+
+    #[test]
+    fn help_and_version_win() {
+        assert_eq!(parse_cli(&argv(&["--help"])), Ok(Cli::Help));
+        assert_eq!(parse_cli(&argv(&["-h"])), Ok(Cli::Help));
+        assert_eq!(parse_cli(&argv(&["--version"])), Ok(Cli::Version));
+        assert_eq!(parse_cli(&argv(&["-V"])), Ok(Cli::Version));
+        // Even alongside other flags.
+        assert_eq!(
+            parse_cli(&argv(&["--resume", "x", "--help"])),
+            Ok(Cli::Help)
+        );
+    }
+
+    #[test]
+    fn unknown_flag_is_fatal_with_hint() {
+        let err = parse_cli(&argv(&["--yolo"])).unwrap_err();
+        assert!(err.contains("unknown flag"), "got: {err}");
+        assert!(err.contains("--help"), "got: {err}");
+    }
+
+    #[test]
+    fn bare_positionals_ignored_for_future_subcommands() {
+        assert_eq!(
+            parse_cli(&argv(&["exec", "do stuff"])),
+            Ok(Cli::Run { resume_id: None })
+        );
     }
 }

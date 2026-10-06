@@ -1,17 +1,17 @@
 # rem — TODO: parity with Claude Code / Codex CLI / Pi
 
 Source: gap analysis of `rem` (dev @ d819188) vs Claude Code, Codex CLI, Pi agent.
-Last updated: 2026-09-30
+Last updated: 2026-10-06
 
 Legend: `[ ]` todo, `[/]` in-progress branch, `[x]` done.
 
 ## P0 — not competitive without these
 
 ### 1. Fix broken tree + ship baseline
-- [ ] Resolve merge conflicts in `src/agent.rs`, `src/main.rs`, `src/tui.rs` (`feat/skills` markers)
-- [ ] `cargo build`, `cargo test`, `cargo fmt`, `cargo clippy -D warnings` green
-- [ ] Merge `feat/skills` cleanly into `dev`
-- [ ] Add license (MIT/Apache-2.0), flesh out README + `--help`
+- [x] Resolve merge conflicts in `src/agent.rs`, `src/main.rs`, `src/tui.rs` (`feat/skills` markers)
+- [x] `cargo build`, `cargo test`, `cargo fmt`, `cargo clippy -D warnings` green
+- [x] Merge `feat/skills` cleanly into `dev`
+- [x] Add license (MIT/Apache-2.0), flesh out README + `--help`
 
 ### 2. Headless / automation interfaces (TUI-only today)
 - [ ] `rem -p "<prompt>"` print mode (pipe final response to stdout)
@@ -28,17 +28,17 @@ Legend: `[ ]` todo, `[/]` in-progress branch, `[x]` done.
 - [ ] `/mcp` command: list servers/tools, reconnect, auth status
 - [ ] MCP tools appear in preamble + `last_tool_events` tree
 
-### 4. `@file` / ref-files (`feat/ref-files` exists, not landed)
-- [ ] Land `feat/ref-files`: `@path` expansion before `chat()`
+### 4. `@file` / ref-files (`feat/ref-files` landed as `f5589b8`)
+- [x] Land `feat/ref-files`: `@path` expansion before `chat()`
 - [ ] Support `@dir/`, `@file:line-range`, multiple refs per prompt
-- [ ] Missing-file error surfaces in TUI, doesn't send turn
+- [x] Missing-file error surfaces in TUI, doesn't send turn
 - [ ] Docs + `/help` entry
 
-### 5. Providers + models (single OpenAI `/chat/completions` today)
-- [ ] Multi-profile config (`[providers.*]`, env-var keys, no hardcoded single `[api]`)
-- [ ] `/model` switch mid-session + `/effort` (`low/medium/high`)
+### 5. Providers + models (multi-provider: OpenAI-compatible + Anthropic native)
+- [x] Multi-profile config (`[providers.*]`, env-var keys, no hardcoded single `[api]`)
+- [x] `/model` switch mid-session + `/effort` (`low/medium/high`)
 - [ ] Anthropic native, Bedrock/Vertex passthrough or OAuth + `/login`
-- [ ] Retry + rate-limit backoff + timeout errors surfaced per-turn
+- [x] Retry + rate-limit backoff + timeout errors surfaced per-turn
 - [ ] Token meter + `/cost` + `/context` (used/total, compaction point)
 
 ### 6. Subagents + task decomposition (single linear loop today)

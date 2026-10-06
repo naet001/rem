@@ -211,6 +211,16 @@ pub(crate) fn reply_rows(text: &str, width: usize, theme: &Theme) -> Vec<Line<'s
     }
 }
 
+/// Chapter break between a turn's tool block and the model's final reply:
+/// a blank row, then a dim full-width rule. The reply's own leading blank
+/// lands after it, so the rule sits centred in the gap.
+pub(crate) fn divider_row(width: usize) -> Vec<Line<'static>> {
+    prepend_blank(vec![Line::from(Span::styled(
+        "─".repeat(width.max(1)),
+        dim(),
+    ))])
+}
+
 /// Short harness status line (`cleared.`, audit notes, `interrupted.`).
 pub(crate) fn notice_row(text: &str, width: usize) -> Vec<Line<'static>> {
     prepend_blank(hang(
@@ -543,6 +553,16 @@ mod tests {
             .find(|l| plain(std::slice::from_ref(l))[0].contains(" ctx"))
             .expect("context line present");
         assert_eq!(ctx_line.spans.last().unwrap().style.bg, Some(Color::Reset));
+    }
+
+    #[test]
+    fn divider_row_is_blank_then_full_width_rule() {
+        let out = divider_row(20);
+        let text: Vec<String> = plain(&out);
+        assert_eq!(text.len(), 2, "got: {text:?}");
+        assert_eq!(text[0], "", "got: {text:?}");
+        assert_eq!(text[1], "─".repeat(20), "got: {text:?}");
+        assert_eq!(out[1].spans[0].style.fg, Some(Color::DarkGray));
     }
 
     #[test]
