@@ -449,7 +449,10 @@ mod tests {
         assert_eq!(out[0].2, "An HTTP client");
     }
 
+    // Live network check: needs DuckDuckGo access. Ignored by default so
+    // `cargo test` stays green offline; run with `cargo test -- --ignored`.
     #[tokio::test]
+    #[ignore]
     async fn live_search_returns_numbered_results() {
         let mut ctx = ToolContext::new();
         let out = WebSearchTool
@@ -465,7 +468,10 @@ mod tests {
         assert!(out.contains("1."), "got: {out}");
     }
 
+    // Live network check: needs internet access. Ignored by default so
+    // `cargo test` stays green offline; run with `cargo test -- --ignored`.
     #[tokio::test]
+    #[ignore]
     async fn live_fetch_example_domain_as_text() {
         let mut ctx = ToolContext::new();
         let out = WebFetchTool
