@@ -986,6 +986,132 @@ fn is_binary_file(path: &std::path::Path) -> bool {
     buf[..n].contains(&0)
 }
 
+/// A parsed `@path:RANGE` suffix. All line numbers are 1-indexed.
+/// `Single(n)` = `@file:n`; `Span{start, end}` = `@file:start-end`
+/// (`end: None` = `@file:start-` to EOF).
+enum AtLineRange {
+    Single(usize),
+    Span { start: usize, end: Option<usize> },
+}
+
+/// Split a raw `@` ref into path + optional line range.
+/// `a.txt:2` -> (`a.txt`, `Some(Single(2))`);
+/// `a.txt:2-5` -> (`a.txt`, `Some(Span{2, Some(5)})`);
+/// `a.txt:2-` -> (`a.txt`, `Some(Span{2, None})`).
+/// No colon, empty path, or non-range suffix -> (`raw`, `None`)
+/// so existing behavior (dirs, plain files) is unchanged.
+/// Note: `0` parses as a range and is rejected downstream with an
+/// out-of-range notice (rather than a missing-file error), so
+/// `@file:0` names the ref it meant.
+fn split_at_line_range(raw: &str) -> (&str, Option<AtLineRange>) {
+    let Some((path, suffix)) = raw.rsplit_once(':') else {
+        return (raw, None);
+    };
+    if path.is_empty() {
+        return (raw, None);
+    }
+    // Closed/open span first: `START-END` or `START-`.
+    // `0` passes through here and is rejected downstream with an
+    // out-of-range notice naming the ref.
+    if let Some((start_s, end_s)) = suffix.split_once('-') {
+        let (Ok(start), end_opt) = (start_s.parse::<usize>(), end_s) else {
+            return (raw, None);
+        };
+        if end_opt.is_empty() {
+            return (path, Some(AtLineRange::Span { start, end: None }));
+        }
+        let Ok(end) = end_opt.parse::<usize>() else {
+            return (raw, None);
+        };
+        return (
+            path,
+            Some(AtLineRange::Span {
+                start,
+                end: Some(end),
+            }),
+        );
+    }
+    // Single line: all digits (0 rejected downstream as out-of-range).
+    match suffix.parse::<usize>() {
+        Ok(n) => (path, Some(AtLineRange::Single(n))),
+        _ => (raw, None),
+    }
+}
+
+/// Split a popup query into path query + `:range` suffix (colon included).
+/// Only splits when the text after the last `:` is range-like
+/// (all-digits, `digits-digits`, or `digits-`); anything else
+/// (`a.txt:abc`, bare `@:`) stays whole so filtering is unchanged.
+/// The suffix is filtered out of the fuzzy query and re-appended on
+/// completion; validity is enforced at expansion time.
+fn split_at_query_suffix(query: &str) -> (&str, &str) {
+    let Some((path, suffix)) = query.rsplit_once(':') else {
+        return (query, "");
+    };
+    if path.is_empty() {
+        return (query, "");
+    }
+    let range_like = if let Some((s, e)) = suffix.split_once('-') {
+        !s.is_empty()
+            && s.bytes().all(|b| b.is_ascii_digit())
+            && (e.is_empty() || e.bytes().all(|b| b.is_ascii_digit()))
+    } else {
+        !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
+    };
+    if !range_like {
+        return (query, "");
+    }
+    // `:` is ASCII, so byte-splitting at it is a char boundary.
+    let cut = query.len() - suffix.len() - 1;
+    (&query[..cut], &query[cut..])
+}
+
+/// Read 1-indexed line(s) of a file for @ expansion. `end: None` reads to
+/// EOF; `Some(end)` clamps past EOF. Errors name the ref path. Output
+/// lines are prefixed with their 1-indexed numbers; the sliced text still
+/// respects the per-file char cap with a truncation note.
+fn read_at_file_range(
+    path: &std::path::Path,
+    display: &str,
+    start: usize,
+    end: Option<usize>,
+) -> Result<String, String> {
+    if path.is_dir() {
+        return Err(format!("@{display}: is a directory"));
+    }
+    if is_binary_file(path) {
+        return Err(format!("@{display}: binary file"));
+    }
+    let content = std::fs::read_to_string(path).map_err(|e| format!("@{display}: {e}"))?;
+    let lines: Vec<&str> = content.lines().collect();
+    if start < 1 || start > lines.len() {
+        return Err(format!(
+            "@{display}: line {start} out of range (file has {} lines)",
+            lines.len()
+        ));
+    }
+    if let Some(e) = end
+        && e < start
+    {
+        return Err(format!("@{display}: invalid range (end before start)"));
+    }
+    let hi = end.unwrap_or(lines.len()).min(lines.len());
+    let numbered: Vec<String> = (start..=hi)
+        .map(|n| format!("{n}: {}", lines[n - 1]))
+        .collect();
+    let body = numbered.join("\n");
+    let cap = crate::context::Context::TOOL_BUDGET;
+    if body.chars().count() > cap {
+        let truncated: String = body.chars().take(cap).collect();
+        let dropped = body.chars().count() - cap;
+        Ok(format!(
+            "{display}:\n```\n{truncated}\n```\n[truncated {dropped} chars]"
+        ))
+    } else {
+        Ok(format!("{display}:\n```\n{body}\n```"))
+    }
+}
+
 /// Read a file for @ expansion, capping at `Context::TOOL_BUDGET` chars.
 /// Returns the formatted fenced block. Errors name the ref path.
 fn read_at_file(path: &std::path::Path, display: &str) -> Result<String, String> {
@@ -1043,12 +1169,25 @@ fn expand_at_refs(text: &str, project_root: &std::path::Path) -> Result<String, 
     }
     let mut blocks = Vec::new();
     for raw in &refs {
-        let full = at_resolve_in_root(project_root, raw)
+        // Line range: split `path:RANGE` before confinement so the
+        // range suffix never becomes part of the resolved path.
+        let (path_part, range_opt) = split_at_line_range(raw);
+        let full = at_resolve_in_root(project_root, path_part)
             .ok_or_else(|| format!("@{raw}: outside project root"))?;
-        if full.is_dir() {
-            blocks.push(read_at_dir(&full, raw)?);
-        } else {
-            blocks.push(read_at_file(&full, raw)?);
+        match range_opt {
+            Some(AtLineRange::Single(n)) => {
+                blocks.push(read_at_file_range(&full, raw, n, Some(n))?);
+            }
+            Some(AtLineRange::Span { start, end }) => {
+                blocks.push(read_at_file_range(&full, raw, start, end)?);
+            }
+            None => {
+                if full.is_dir() {
+                    blocks.push(read_at_dir(&full, raw)?);
+                } else {
+                    blocks.push(read_at_file(&full, raw)?);
+                }
+            }
         }
     }
     Ok(format!("{text}\n\n{}", blocks.join("\n\n")))
@@ -1227,7 +1366,9 @@ fn at_row_count(app: &App) -> usize {
     if partial.is_empty() {
         return entries.len(); // bare @: show everything
     }
-    fuzzy_at_candidates(&entries, &partial).len()
+    // Range suffix (`:1-2`) filters on the path part only.
+    let (path_query, _) = split_at_query_suffix(&partial);
+    fuzzy_at_candidates(&entries, path_query).len()
 }
 
 /// Reconcile `menu_sel` and `at_sel` with the current input after an edit.
@@ -2266,10 +2407,11 @@ fn handle_key(
                 let partial = active_at_token(&app.input, app.cursor)
                     .unwrap_or_default()
                     .2;
+                let (path_query, range_suffix) = split_at_query_suffix(&partial);
                 let filtered = if partial.is_empty() {
                     entries // bare @: all candidates
                 } else {
-                    fuzzy_at_candidates(&entries, &partial)
+                    fuzzy_at_candidates(&entries, path_query)
                 };
                 if filtered.is_empty() {
                     return false;
@@ -2277,14 +2419,18 @@ fn handle_key(
                 let idx = app.at_sel.unwrap_or(0).min(filtered.len() - 1);
                 let completed = filtered[idx].clone();
                 // Replace chars at_idx+1..end_idx (after the @) with the
-                // completed path + trailing space (terminates the token so
-                // the @-menu closes and the next Enter submits, mirroring
-                // Claude Code's completion behavior).
+                // completed path + preserved `:range` suffix + trailing
+                // space (terminates the token so the @-menu closes and the
+                // next Enter submits, mirroring Claude Code's completion
+                // behavior).
                 let chars: Vec<char> = app.input.chars().collect();
                 let before: String = chars[..at_idx + 1].iter().collect();
                 let after: String = chars[end_idx..].iter().collect();
-                app.input = format!("{before}{completed} {after}");
-                app.cursor = before.chars().count() + completed.chars().count() + 1;
+                app.input = format!("{before}{completed}{range_suffix} {after}");
+                app.cursor = before.chars().count()
+                    + completed.chars().count()
+                    + range_suffix.chars().count()
+                    + 1;
                 clamp_menu_sel(app);
                 return false;
             }
@@ -2654,6 +2800,7 @@ fn submit(
                     let usage = if c.takes_arg { " <arg>" } else { "" };
                     msg.push_str(&format!("\n  /{}{usage} — {}", c.name, c.desc));
                 }
+                msg.push_str("\nfile refs: @file inlines content; @dir/ lists; @file:10-20 slices lines (also @file:42, @file:100-); multiple refs expand in order; a missing/unreadable/binary/outside-root ref blocks submit and names the bad ref");
                 app.enqueue_notice(msg);
                 return false;
             }
@@ -4037,7 +4184,9 @@ fn render_at_menu(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let candidates = if partial.is_empty() {
         entries // bare @: show everything
     } else {
-        fuzzy_at_candidates(&entries, &partial)
+        // Range suffix (`:1-2`) filters on the path part only.
+        let (path_query, _) = split_at_query_suffix(&partial);
+        fuzzy_at_candidates(&entries, path_query)
     };
     if candidates.is_empty() {
         return;
@@ -6186,6 +6335,47 @@ mod tests {
     }
 
     #[test]
+    fn slash_help_documents_at_mentions() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/help".to_string();
+        app.cursor = 5;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        let flat: String = app
+            .print_queue
+            .iter()
+            .flatten()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Transcript wraps: normalize whitespace before matching.
+        let flat: String = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+        for want in [
+            "@file",
+            "@dir/",
+            "@file:10-20",
+            "multiple",
+            "names the bad ref",
+        ] {
+            assert!(flat.contains(want), "help missing {want}: {flat}");
+        }
+    }
+
+    #[test]
     fn slash_submit_help_lists_every_registry_command() {
         let mut app = App::new("model".to_string(), "medium".to_string());
         let agent = std::sync::Arc::new(StubAgent);
@@ -7078,6 +7268,151 @@ mod tests {
     }
 
     #[test]
+    fn at_expand_line_zero_blocks() {
+        let dir = std::env::temp_dir().join("rem-at-range-zero-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("a.txt"), "line1\n").unwrap();
+        let result = expand_at_refs("look at @a.txt:0", &dir);
+        assert!(result.is_err(), "expected Err, got: {result:?}");
+        assert!(result.unwrap_err().contains("out of range"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_expand_non_numeric_suffix_blocks_naming_ref() {
+        let dir = std::env::temp_dir().join("rem-at-range-nonnumeric-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+        // No file named `a.txt:abc` exists: falls back to a plain path ref
+        // and blocks naming the ref it meant.
+        let result = expand_at_refs("look at @a.txt:abc", &dir);
+        assert!(result.is_err(), "expected Err, got: {result:?}");
+        assert!(result.unwrap_err().contains("a.txt:abc"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_expand_range_slice_respects_char_cap() {
+        let dir = std::env::temp_dir().join("rem-at-range-cap-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let long_line = "y".repeat(2500);
+        std::fs::write(dir.join("a.txt"), format!("short\n{long_line}\n")).unwrap();
+        let result = expand_at_refs("look at @a.txt:1-2", &dir).unwrap();
+        assert!(result.contains("[truncated "), "got: {result}");
+        assert!(result.contains("1: short"), "got: {result}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_expand_open_line_range_reads_to_eof() {
+        let dir = std::env::temp_dir().join("rem-at-range-open-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("a.txt"), "line1\nline2\nline3\n").unwrap();
+        let result = expand_at_refs("look at @a.txt:2-", &dir).unwrap();
+        assert!(result.contains("2: line2"), "got: {result}");
+        assert!(result.contains("3: line3"), "got: {result}");
+        assert!(!result.contains("line1"), "got: {result}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_expand_end_past_eof_clamps() {
+        let dir = std::env::temp_dir().join("rem-at-range-clamp-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("a.txt"), "line1\nline2\n").unwrap();
+        let result = expand_at_refs("look at @a.txt:2-99", &dir).unwrap();
+        assert!(result.contains("2: line2"), "got: {result}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_expand_reversed_range_blocks() {
+        let dir = std::env::temp_dir().join("rem-at-range-rev-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("a.txt"), "line1\nline2\n").unwrap();
+        let result = expand_at_refs("look at @a.txt:2-1", &dir);
+        assert!(result.is_err(), "expected Err, got: {result:?}");
+        assert!(result.unwrap_err().contains("a.txt:2-1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_expand_start_past_eof_blocks() {
+        let dir = std::env::temp_dir().join("rem-at-range-oob-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("a.txt"), "line1\n").unwrap();
+        let result = expand_at_refs("look at @a.txt:9", &dir);
+        assert!(result.is_err(), "expected Err, got: {result:?}");
+        assert!(result.unwrap_err().contains("out of range"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_expand_range_on_dir_blocks() {
+        let dir = std::env::temp_dir().join("rem-at-range-dir-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join("sub"));
+        let result = expand_at_refs("look at @sub:1-2", &dir);
+        assert!(result.is_err(), "expected Err, got: {result:?}");
+        assert!(result.unwrap_err().contains("is a directory"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_expand_mixed_plain_and_range_preserves_order() {
+        let dir = std::env::temp_dir().join("rem-at-range-mixed-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("a.txt"), "a1\na2\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "b1\nb2\n").unwrap();
+        let result = expand_at_refs("see @a.txt:1 and @b.txt", &dir).unwrap();
+        let pos_a = result.find("a.txt:1").unwrap();
+        let pos_b = result.find("b.txt:").unwrap();
+        assert!(pos_a < pos_b, "got: {result}");
+        assert!(result.contains("1: a1"), "got: {result}");
+        assert!(result.contains("b1"), "got: {result}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_expand_closed_line_range() {
+        let dir = std::env::temp_dir().join("rem-at-range-closed-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("a.txt"), "line1\nline2\nline3\nline4\n").unwrap();
+        let result = expand_at_refs("look at @a.txt:2-3", &dir).unwrap();
+        assert!(result.starts_with("look at @a.txt:2-3"), "got: {result}");
+        assert!(result.contains("a.txt:2-3"), "got: {result}");
+        assert!(result.contains("2: line2"), "got: {result}");
+        assert!(result.contains("3: line3"), "got: {result}");
+        assert!(!result.contains("line1"), "got: {result}");
+        assert!(!result.contains("line4"), "got: {result}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_expand_single_line_range() {
+        let dir = std::env::temp_dir().join("rem-at-range-single-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("a.txt"), "line1\nline2\nline3\n").unwrap();
+        let result = expand_at_refs("look at @a.txt:2", &dir).unwrap();
+        assert!(result.starts_with("look at @a.txt:2"), "got: {result}");
+        assert!(result.contains("a.txt:2"), "got: {result}");
+        assert!(result.contains("2: line2"), "got: {result}");
+        assert!(!result.contains("line1"), "got: {result}");
+        assert!(!result.contains("line3"), "got: {result}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn at_expand_no_refs_returns_original() {
         let dir = std::env::temp_dir();
         let result = expand_at_refs("no refs here", &dir).unwrap();
@@ -7190,6 +7525,43 @@ mod tests {
         // Bare @ should open the menu (showing all walk entries)
         assert!(at_menu_open(&app), "bare @ should open popup");
         assert!(at_row_count(&app) > 0, "bare @ should have rows");
+    }
+
+    #[test]
+    fn at_menu_tab_preserves_range_suffix() {
+        // Files under cwd so the popup walk finds them.
+        let test_dir = std::env::current_dir()
+            .unwrap()
+            .join(".rem_at_range_popup_test");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        let _ = std::fs::create_dir_all(&test_dir);
+        std::fs::write(test_dir.join("hello.rs"), "a\nb\nc\n").unwrap();
+
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.input = "look @.rem_at_range_popup_test/hello.rs:1-2".to_string();
+        app.cursor = app.input.chars().count();
+        clamp_menu_sel(&mut app);
+        assert!(at_menu_open(&app), "popup should open for ranged ref");
+
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Tab,
+            KeyModifiers::empty()
+        ));
+        assert!(
+            app.input.contains(".rem_at_range_popup_test/hello.rs:1-2"),
+            "Tab must preserve :1-2, got: {}",
+            app.input
+        );
+        assert!(!app.busy, "Tab should not start a turn");
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 
     #[test]

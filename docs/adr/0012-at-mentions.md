@@ -120,8 +120,9 @@ absorption. Tools already cover the read side (`read`, `list_directory`,
   naming the ref.
 - Docs: glossary gains `@` mention terms; ADR-0004/0005 deferred items
   shrink to token/cost + review rows.
-- Deferred: quoted-space paths, fuzzy matching, recursive `@dir`, `@@`
-  escape, MCP resources, per-directory `AGENTS.md`.
+- Deferred: quoted-space paths, recursive `@dir`, `@@`
+  escape, MCP resources, per-directory `AGENTS.md`. (Line ranges and
+  fuzzy matching have since landed.)
 
 ## P1/P2 Resolved (plan-time, 2026-09-30)
 
@@ -129,6 +130,16 @@ absorption. Tools already cover the read side (`read`, `list_directory`,
   any `\0` present. Lossy-UTF8 without NUL is not binary-blocked.
 - **P2 dir sort order:** `lines.sort()` byte order, identical to
   `list_directory`.
+
+## Line-range follow-up (landed 2026-10-06)
+
+- `@file:START-END` / `@file:START-` (to EOF) / `@file:LINE` slice
+  1-indexed numbered lines; `END` past EOF clamps, `START` past EOF /
+  `0` / reversed ranges / range-on-directory block naming the ref.
+- Slice respects the per-file char cap; popup filters on the path part
+  and preserves the `:range` suffix on completion.
+- `/help` + README document `@file`, `@dir/`, ranges, multi-ref,
+  caps, and block behavior.
 
 ## Open Questions
 

@@ -28,11 +28,12 @@ Legend: `[ ]` todo, `[/]` in-progress branch, `[x]` done.
 - [ ] `/mcp` command: list servers/tools, reconnect, auth status
 - [ ] MCP tools appear in preamble + `last_tool_events` tree
 
-### 4. `@file` / ref-files (`feat/ref-files` landed as `f5589b8`)
+### 4. `@file` / ref-files (`feat/ref-files` landed as `f5589b8`; `@dir/` + multi-ref + blocks verified, ranges + docs landed 2026-10-06)
 - [x] Land `feat/ref-files`: `@path` expansion before `chat()`
-- [ ] Support `@dir/`, `@file:line-range`, multiple refs per prompt
-- [x] Missing-file error surfaces in TUI, doesn't send turn
-- [ ] Docs + `/help` entry
+- [x] Support `@dir/`, multiple refs per prompt (appearance order, `list_directory` parity, verified in tree)
+- [x] Support `@file:line-range` (`START-END`, `START-` to EOF, single `LINE`; numbered lines; `END` clamps; invalid/range-on-dir blocks naming the ref; cap respected; popup preserves suffix)
+- [x] Missing-file error surfaces in TUI, doesn't send turn (+ binary/outside-root/invalid-range blocks, same channel)
+- [x] Docs + `/help` entry (`/help` footer, README section, glossary + ADR-0012 notes)
 
 ### 5. Providers + models (multi-provider: OpenAI-compatible + Anthropic native)
 - [x] Multi-profile config (`[providers.*]`, env-var keys, no hardcoded single `[api]`)
