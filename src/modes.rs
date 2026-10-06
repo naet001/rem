@@ -27,4 +27,17 @@ impl Mode {
             Self::Yolo => "yolo",
         }
     }
+
+    /// Parse a `--mode <name>` value (grilled P0-#2: the single headless
+    /// mode flag; no `--yolo`/`--plan` shorthands). Case-insensitive.
+    pub fn from_name(raw: &str) -> Option<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "plan" => Some(Self::Plan),
+            "manual" => Some(Self::Manual),
+            "auto" => Some(Self::Auto),
+            "edit" => Some(Self::Edit),
+            "yolo" => Some(Self::Yolo),
+            _ => None,
+        }
+    }
 }

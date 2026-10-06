@@ -1,6 +1,7 @@
 mod agent;
 mod config;
 mod context;
+mod headless;
 mod history;
 mod markdown;
 mod modes;
@@ -14,39 +15,62 @@ mod tui;
 
 use agent::{AgentLoop, RigAgent};
 use config::Config;
+use headless::OutputFormat;
+use modes::Mode;
 use tui::{RatatuiBackend, TuiBackend};
 
 /// `rem --help` text: flags, config, sessions, in-TUI pointers.
-const HELP: &str = "rem \u{2014} a terminal coding agent you can audit.
+const HELP: &str = "rem — a terminal coding agent you can audit.
 
 Usage:
   rem                    start a new session (TUI)
   rem --resume <id>      resume a saved session (TUI)
+  rem -p \"<prompt>\"       run one turn headless, print reply to stdout
   rem --help, -h         show this help and exit
   rem --version, -V      show version and exit
 
+Headless (all flags require -p/--print):
+  -p, --print [\"<prompt>\"]  enable print mode; prompt is trailing args.
+                            pipe stdin too (echo ... | rem -p \"...\");
+                            stdin first + -p second, either alone works.
+  --resume <id>          continue a saved session headless
+  --mode <name>          plan | manual | auto | edit | yolo (default manual)
+  --allow-all            auto-approve Confirm verdicts (Deny floor still holds)
+  --output <fmt>         text (default) | json | jsonl event stream
+
 Config: ~/.config/rem/config.toml (see config.example.toml).
-  active_provider + [providers.*] entries; keys use env:VAR indirection \u{2014}
+  active_provider + [providers.*] entries; keys use env:VAR indirection —
   export OPENAI_API_KEY / ANTHROPIC_API_KEY to match.
 
 Sessions persist per turn in SQLite under your platform data dir; on exit
-rem prints `Session saved. Resume with: rem --resume <id>`.
+rem prints `Session saved. Resume with: rem --resume <id>` (stderr headless).
 
 Inside the TUI: /quit /new /help /theme /init /resume /rename /fork
 /skills /skill:<name> /model /effort /context, Shift+Tab cycles modes,
 @path inlines file/dir contents. Docs: README.md, docs/adr/.";
 
-/// CLI shape: run (fresh or resume) vs immediate stdout actions.
+/// CLI shape: TUI run (fresh or resume) vs headless print vs immediate
+/// stdout actions. Headless is `-p` only (grilled P0-#2: no `exec`).
 #[derive(Debug, PartialEq, Eq)]
 enum Cli {
-    Run { resume_id: Option<String> },
+    Run {
+        resume_id: Option<String>,
+    },
+    Print {
+        prompt: Option<String>,
+        resume_id: Option<String>,
+        mode: Option<Mode>,
+        allow_all: bool,
+        output: OutputFormat,
+    },
     Help,
     Version,
 }
 
 /// Parse `std::env::args` without new deps. `--help`/`--version` win over
-/// everything; unknown `--flags` are fatal; bare positionals are ignored
-/// (reserved for future subcommands like `exec`).
+/// everything; unknown `--flags` are fatal. `-p`/`--print` switches to
+/// headless: trailing bare args join into the prompt (stdin supplies the
+/// rest). `--mode` / `--allow-all` / `--output` require `-p`.
 fn parse_cli(args: &[String]) -> Result<Cli, String> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         return Ok(Cli::Help);
@@ -54,24 +78,100 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     if args.iter().any(|a| a == "--version" || a == "-V") {
         return Ok(Cli::Version);
     }
+    let mut print_mode = false;
+    let mut prompt_parts: Vec<String> = Vec::new();
     let mut resume_id: Option<String> = None;
+    let mut mode: Option<Mode> = None;
+    let mut allow_all = false;
+    let mut output = OutputFormat::Text;
     let mut i = 1;
     while i < args.len() {
-        match args[i].as_str() {
-            "--resume" => {
-                if i + 1 >= args.len() {
-                    return Err("--resume requires a session id".to_string());
-                }
-                resume_id = Some(args[i + 1].clone());
-                i += 2;
+        let a = args[i].as_str();
+        if a == "-p" || a == "--print" {
+            print_mode = true;
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("--print=") {
+            print_mode = true;
+            if !v.is_empty() {
+                prompt_parts.push(v.to_string());
             }
-            flag if flag.starts_with('-') => {
-                return Err(format!("unknown flag {flag} (see rem --help)"));
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("-p=") {
+            print_mode = true;
+            if !v.is_empty() {
+                prompt_parts.push(v.to_string());
             }
-            _ => {
-                i += 1;
+            i += 1;
+        } else if a == "--resume" {
+            if i + 1 >= args.len() {
+                return Err("--resume requires a session id".to_string());
             }
+            resume_id = Some(args[i + 1].clone());
+            i += 2;
+        } else if let Some(v) = a.strip_prefix("--resume=") {
+            if v.is_empty() {
+                return Err("--resume requires a session id".to_string());
+            }
+            resume_id = Some(v.to_string());
+            i += 1;
+        } else if a == "--mode" {
+            if i + 1 >= args.len() {
+                return Err("--mode requires plan|manual|auto|edit|yolo".to_string());
+            }
+            mode =
+                Some(Mode::from_name(&args[i + 1]).ok_or_else(|| {
+                    format!("unknown --mode \"{}\" (see rem --help)", args[i + 1])
+                })?);
+            i += 2;
+        } else if let Some(v) = a.strip_prefix("--mode=") {
+            mode = Some(
+                Mode::from_name(v)
+                    .ok_or_else(|| format!("unknown --mode \"{v}\" (see rem --help)"))?,
+            );
+            i += 1;
+        } else if a == "--allow-all" {
+            allow_all = true;
+            i += 1;
+        } else if a == "--output" {
+            if i + 1 >= args.len() {
+                return Err("--output requires text|json|jsonl".to_string());
+            }
+            output = OutputFormat::parse(&args[i + 1])
+                .ok_or_else(|| format!("unknown --output \"{}\" (see rem --help)", args[i + 1]))?;
+            i += 2;
+        } else if let Some(v) = a.strip_prefix("--output=") {
+            output = OutputFormat::parse(v)
+                .ok_or_else(|| format!("unknown --output \"{v}\" (see rem --help)"))?;
+            i += 1;
+        } else if a.starts_with('-') {
+            return Err(format!("unknown flag {a} (see rem --help)"));
+        } else {
+            prompt_parts.push(args[i].clone());
+            i += 1;
         }
+    }
+    if print_mode {
+        let prompt = match prompt_parts.is_empty() {
+            true => None,
+            false => Some(prompt_parts.join(" ")),
+        };
+        return Ok(Cli::Print {
+            prompt,
+            resume_id,
+            mode,
+            allow_all,
+            output,
+        });
+    }
+    if mode.is_some() || allow_all || output != OutputFormat::Text {
+        return Err("--mode/--allow-all/--output require -p/--print (see rem --help)".to_string());
+    }
+    if !prompt_parts.is_empty() {
+        return Err(format!(
+            "unexpected argument \"{}\" (did you mean rem -p \"{}\"? see rem --help)",
+            prompt_parts[0],
+            prompt_parts.join(" ")
+        ));
     }
     Ok(Cli::Run { resume_id })
 }
@@ -80,7 +180,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
 async fn main() {
     // Flags that never touch config, db, or the TUI.
     let args: Vec<String> = std::env::args().collect();
-    let resume_id: Option<String> = match parse_cli(&args) {
+    let cli: Cli = match parse_cli(&args) {
         Ok(Cli::Help) => {
             println!("{HELP}");
             return;
@@ -89,11 +189,34 @@ async fn main() {
             println!("rem {}", env!("CARGO_PKG_VERSION"));
             return;
         }
-        Ok(Cli::Run { resume_id }) => resume_id,
+        Ok(c) => c,
         Err(e) => {
             eprintln!("rem: {e}");
             std::process::exit(2);
         }
+    };
+
+    // Headless print mode: no TUI, stdout stays pipeable.
+    if let Cli::Print {
+        prompt,
+        resume_id,
+        mode,
+        allow_all,
+        output,
+    } = cli
+    {
+        let code = headless::run_print(headless::PrintOpts {
+            prompt,
+            resume_id,
+            mode,
+            allow_all,
+            output,
+        })
+        .await;
+        std::process::exit(code);
+    }
+    let Cli::Run { resume_id } = cli else {
+        unreachable!("help/version/print handled above");
     };
 
     let cfg = match Config::from_file() {
@@ -279,10 +402,86 @@ mod tests {
     }
 
     #[test]
-    fn bare_positionals_ignored_for_future_subcommands() {
+    fn bare_positionals_require_print_hint() {
+        let err = parse_cli(&argv(&["exec", "do stuff"])).unwrap_err();
+        assert!(err.contains("-p"), "got: {err}");
+    }
+
+    #[test]
+    fn print_captures_prompt_positionals() {
         assert_eq!(
-            parse_cli(&argv(&["exec", "do stuff"])),
-            Ok(Cli::Run { resume_id: None })
+            parse_cli(&argv(&["-p", "do stuff"])),
+            Ok(Cli::Print {
+                prompt: Some("do stuff".to_string()),
+                resume_id: None,
+                mode: None,
+                allow_all: false,
+                output: OutputFormat::Text,
+            })
         );
+        assert_eq!(
+            parse_cli(&argv(&["--print", "do", "stuff"])),
+            Ok(Cli::Print {
+                prompt: Some("do stuff".to_string()),
+                resume_id: None,
+                mode: None,
+                allow_all: false,
+                output: OutputFormat::Text,
+            })
+        );
+    }
+
+    #[test]
+    fn print_without_prompt_is_allowed_for_stdin() {
+        assert_eq!(
+            parse_cli(&argv(&["-p"])),
+            Ok(Cli::Print {
+                prompt: None,
+                resume_id: None,
+                mode: None,
+                allow_all: false,
+                output: OutputFormat::Text,
+            })
+        );
+    }
+
+    #[test]
+    fn print_parses_mode_allow_all_output_and_resume() {
+        assert_eq!(
+            parse_cli(&argv(&[
+                "-p",
+                "hi",
+                "--mode",
+                "auto",
+                "--allow-all",
+                "--output",
+                "json",
+                "--resume",
+                "abc"
+            ])),
+            Ok(Cli::Print {
+                prompt: Some("hi".to_string()),
+                resume_id: Some("abc".to_string()),
+                mode: Some(Mode::Auto),
+                allow_all: true,
+                output: OutputFormat::Json,
+            })
+        );
+    }
+
+    #[test]
+    fn print_rejects_unknown_mode_and_output() {
+        assert!(parse_cli(&argv(&["-p", "hi", "--mode", "turbo"])).is_err());
+        assert!(parse_cli(&argv(&["-p", "hi", "--output", "yaml"])).is_err());
+    }
+
+    #[test]
+    fn headless_flags_require_print() {
+        let err = parse_cli(&argv(&["--mode", "auto"])).unwrap_err();
+        assert!(err.contains("-p"), "got: {err}");
+        let err = parse_cli(&argv(&["--allow-all"])).unwrap_err();
+        assert!(err.contains("-p"), "got: {err}");
+        let err = parse_cli(&argv(&["--output", "json"])).unwrap_err();
+        assert!(err.contains("-p"), "got: {err}");
     }
 }

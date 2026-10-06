@@ -7,7 +7,7 @@
 - **Principal**: The LLM-driven agent loop (`RigAgent`). Untrusted for side effects; all mutations go through the gate.
 - **Gate**: The enforcement point. A Rig `AgentHook::on_tool_call` implementation that classifies every tool call before execution. Single choke point, no tool-side bypass.
 - **Policy**: Pure function `ToolCall -> Verdict`. Decides `Allow | Confirm | Deny` from tool name + args + session rules. No I/O, fully unit-testable.
-- **Approver**: The human in the TUI. The only entity that can resolve a `Confirm` into `Allow | Deny`.
+- **Approver**: The human in the TUI, or the `--allow-all` auto-approver headless (`Confirm` -> `Approve`). The only entities that can resolve a `Confirm` into `Allow | Deny`. Default headless attaches no approver, so `Confirm` fails closed to skip. `Deny` never reaches any approver.
 - **Run**: One `RigAgent::chat()` invocation, which internally may take up to 100 model/tool steps. Approvals must block *inside* the run, never kill it.
 
 ## Verdicts
@@ -81,6 +81,14 @@
 - **Invoke**: `/skill:<name> [task]` colon form; leading stacked mentions (up to 6) expand bodies in order with `$ARGUMENTS` substitution. Transcript shows the short form.
 - **Reload**: `/skills reload` re-scans + rebuilds the inner agent so normal chat auto-knows new skills; history/hooks/mode preserved, fail-closed on error. Refused while busy.
 - **Lenient load**: missing `description` → first body line; bad YAML → name-only with note, direct invoke still works.
+
+## Subagents (ADR-0015, ADR-0016)
+
+- **TodoWrite**: `todowrite` tool owning the session task list (full-list replace; `content` + `status` `pending` / `in_progress` / `completed`). Agent-shared state, never persisted; `/todos` shows it, `/new` clears it. `Allow` in every mode.
+- **Task**: `task` tool spawning scoped subagent(s): single (`description` label + `prompt`) or fan-out (`tasks[]`, up to 8, 4 at a time, merged as `##` sections in input order). Fresh context per child, identical preamble + delegation note, same tools minus `task` (depth-1, no recursion), shared approval channel. Parent transcript shows one row. `Allow` in every mode; child calls gated by the same Policy.
+- **Fan-out**: bounded-parallel `tasks[]` batch on a scoped `JoinSet` (drop-the-future aborts all, so Esc works with zero TUI changes). Partial merge: per-child `## <label> (error)` blocks, never whole-batch failure.
+- **Child label**: `PermissionHook::with_task_label` clone sharing the parent approval channel; the FIFO modal shows `tool [label]` + `[subagent label]` reason so parallel Confirms attribute.
+- **Background**: `background:true` detaches the call into the session `BackgroundStore` (`task-N` ids, session-memory only, `/new` clears, headless degrades to inline). Result returns via TUI inject-on-next-submit; `/tasks` lists, `/tasks <id>` shows the summary.
 
 ## Non-goals (v1)
 

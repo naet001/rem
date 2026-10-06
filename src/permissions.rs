@@ -62,6 +62,11 @@ pub struct ApprovalRequest {
     #[allow(dead_code)]
     pub full_args: serde_json::Value,
     pub reason: String,
+    /// Diff-accept flow: the proposed `+`/`-` patch for Mutate (`edit`/
+    /// `write`) confirms, rendered tinted in the modal. `None` for other
+    /// tools (or when the edits don't apply): presentation degrades to the
+    /// plain args preview.
+    pub patch: Option<String>,
     pub reply: tokio::sync::oneshot::Sender<ApprovalDecision>,
 }
 
@@ -96,7 +101,14 @@ pub fn classify_mode(
     if mode == Mode::Plan
         && !matches!(
             tool_name,
-            "read" | "list_directory" | "glob" | "grep" | "git_status" | "git_diff"
+            "read"
+                | "list_directory"
+                | "glob"
+                | "grep"
+                | "git_status"
+                | "git_diff"
+                | "todowrite"
+                | "task"
         )
     {
         return Verdict::Deny {
@@ -108,7 +120,8 @@ pub fn classify_mode(
     }
     match tool_name {
         // Read-only tools: automatic.
-        "read" | "list_directory" | "glob" | "grep" | "git_status" | "git_diff" => Verdict::Allow,
+        "read" | "list_directory" | "glob" | "grep" | "git_status" | "git_diff" | "todowrite"
+        | "task" => Verdict::Allow,
         // Mutations: approval, with a narrow auto fast-path.
         "write" | "edit" => match mode {
             Mode::Manual => Verdict::Confirm {
@@ -597,6 +610,9 @@ pub struct PermissionHook {
     session_allows: Arc<Mutex<HashSet<String>>>,
     mode: Arc<Mutex<Mode>>,
     pending_notes: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Subagent attribution label: `None` on the parent leg, `Some(desc)`
+    /// on child gates so fan-out Confirms name their child in the modal.
+    task_label: Option<String>,
 }
 
 impl PermissionHook {
@@ -607,7 +623,26 @@ impl PermissionHook {
             session_allows: Arc::new(Mutex::new(HashSet::new())),
             mode,
             pending_notes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            task_label: None,
         }
+    }
+
+    /// Child attribution: clone sharing the same approval channel but
+    /// naming the subagent, so fan-out Confirms serialize on the one FIFO
+    /// queue with a `[label]` prefix in the modal.
+    pub fn with_task_label(&self, label: &str) -> Self {
+        Self {
+            task_label: Some(label.to_string()),
+            ..self.clone()
+        }
+    }
+
+    /// Test probe: true when both hooks park approvals on the same channel.
+    /// Serial `task` children must share the parent gate's channel so
+    /// Confirm verdicts serialize on the one queue the Approver answers.
+    #[cfg(test)]
+    pub fn shares_approval_channel(&self, other: &Self) -> bool {
+        self.tx.same_channel(&other.tx)
     }
 
     /// Risk level for Ctrl+E panel. Simple rules by tool name.
@@ -642,6 +677,14 @@ impl PermissionHook {
     /// Short preview for the approval modal (mirrors `ToolEvent::arg_preview`
     /// so the human sees what the transcript shows).
     pub fn preview(tool_name: &str, args: &serde_json::Value) -> String {
+        // `todowrite`/`task` are Allow in every mode so this never pops,
+        // but keep the mirror for transcript parity.
+        if tool_name == "todowrite" {
+            return crate::agent::todowrite_preview(args);
+        }
+        if tool_name == "task" {
+            return crate::tools::task_preview(args);
+        }
         let get = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_string);
         match tool_name {
             "read" | "write" | "edit" | "list_directory" => {
@@ -738,11 +781,24 @@ impl PermissionHook {
         call_id: &str,
     ) -> ToolCallAction {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        // Diff-accept: propose the patch for Mutate confirms so the modal
+        // can show what will land. Non-mutate tools (and inapplicable
+        // edits) degrade to the plain preview.
+        let patch = crate::tools::propose_patch(tool_name, parsed, &self.project_root);
+        let preview = Self::preview(tool_name, parsed);
+        let (display_name, reason) = match &self.task_label {
+            Some(label) => (
+                format!("{tool_name} [{label}]"),
+                format!("[subagent {label}] {reason}"),
+            ),
+            None => (tool_name.to_string(), reason),
+        };
         let req = ApprovalRequest {
-            tool_name: tool_name.to_string(),
-            args_preview: Self::preview(tool_name, parsed),
+            tool_name: display_name,
+            args_preview: preview,
             full_args: parsed.clone(),
             reason,
+            patch,
             reply: reply_tx,
         };
         // Fail closed: no TUI listening -> deny in-run, model replans.
@@ -819,6 +875,38 @@ mod tests {
                 classify(tool, &args(serde_json::json!({})), &root()),
                 Verdict::Allow,
                 "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn todowrite_is_automatic_in_all_modes() {
+        for mode in Mode::ALL {
+            assert_eq!(
+                classify_mode(
+                    "todowrite",
+                    &args(serde_json::json!({"todos": []})),
+                    &root(),
+                    mode
+                ),
+                Verdict::Allow,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_is_automatic_in_all_modes() {
+        for mode in Mode::ALL {
+            assert_eq!(
+                classify_mode(
+                    "task",
+                    &args(serde_json::json!({"description": "d", "prompt": "p"})),
+                    &root(),
+                    mode
+                ),
+                Verdict::Allow,
+                "{mode:?}"
             );
         }
     }
@@ -1068,5 +1156,106 @@ mod tests {
             .unwrap();
         let action = handle.await.unwrap();
         assert!(matches!(action, ToolCallAction::Run), "{action:?}");
+    }
+
+    #[tokio::test]
+    async fn labeled_child_gate_prefixes_approval_request() {
+        // Fan-out attribution: the child gate shares the parent channel
+        // (same FIFO queue) but names the subagent in the modal.
+        use rig::agent::ToolCallAction;
+        let (tx, mut rx) = approval_channel();
+        let parent = PermissionHook::new(tx, root(), Arc::new(Mutex::new(Mode::Manual)));
+        let child = parent.with_task_label("fix login");
+        assert!(parent.shares_approval_channel(&child));
+        let parsed = serde_json::json!({"command": "cargo test"});
+        let key = rule_key("bash", &parsed);
+        let handle = tokio::spawn({
+            let child = child.clone();
+            let parsed = parsed.clone();
+            async move {
+                child
+                    .resolve_confirm("bash", &parsed, key, "test".to_string(), "call-1")
+                    .await
+            }
+        });
+        let req = rx.recv().await.expect("approval request");
+        assert_eq!(req.tool_name, "bash [fix login]");
+        assert!(
+            req.reason.contains("[subagent fix login]"),
+            "got: {}",
+            req.reason
+        );
+        assert_eq!(req.args_preview, "cargo test");
+        req.reply
+            .send(ApprovalDecision::Approve {
+                comment: String::new(),
+            })
+            .unwrap();
+        let action = handle.await.unwrap();
+        assert!(matches!(action, ToolCallAction::Run), "{action:?}");
+    }
+
+    #[tokio::test]
+    async fn mutate_confirm_carries_proposed_patch() {
+        // Diff-accept flow: an `edit` Confirm parks an ApprovalRequest that
+        // carries the proposed patch so the modal can show it.
+        use rig::agent::ToolCallAction;
+        let proj = std::env::temp_dir().join(format!("rem-gate-patch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&proj);
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("f.rs"), "fn a() {}\n").unwrap();
+
+        let (tx, mut rx) = approval_channel();
+        let hook = PermissionHook::new(tx, proj.clone(), Arc::new(Mutex::new(Mode::Manual)));
+        let parsed = serde_json::json!({
+            "path": "f.rs",
+            "edits": [{ "oldText": "fn a() {}", "newText": "fn a(x: u8) {}" }]
+        });
+        let key = rule_key("edit", &parsed);
+        let handle = tokio::spawn({
+            let hook = hook.clone();
+            let parsed = parsed.clone();
+            async move {
+                hook.resolve_confirm("edit", &parsed, key, "test".to_string(), "call-1")
+                    .await
+            }
+        });
+        let req = rx.recv().await.expect("approval request");
+        let patch = req.patch.as_deref().expect("edit confirm carries a patch");
+        assert!(patch.contains("-fn a() {}"), "got: {patch}");
+        assert!(patch.contains("+fn a(x: u8) {}"), "got: {patch}");
+        req.reply
+            .send(ApprovalDecision::Deny {
+                comment: String::new(),
+            })
+            .unwrap();
+        let action = handle.await.unwrap();
+        assert!(matches!(action, ToolCallAction::Skip(_)), "{action:?}");
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[tokio::test]
+    async fn non_mutate_confirm_has_no_patch() {
+        // bash confirms keep the plain-args presentation.
+        let (tx, mut rx) = approval_channel();
+        let hook = PermissionHook::new(tx, root(), Arc::new(Mutex::new(Mode::Manual)));
+        let parsed = serde_json::json!({"command": "cargo test"});
+        let key = rule_key("bash", &parsed);
+        let handle = tokio::spawn({
+            let hook = hook.clone();
+            let parsed = parsed.clone();
+            async move {
+                hook.resolve_confirm("bash", &parsed, key, "test".to_string(), "call-1")
+                    .await
+            }
+        });
+        let req = rx.recv().await.expect("approval request");
+        assert!(req.patch.is_none());
+        req.reply
+            .send(ApprovalDecision::Deny {
+                comment: String::new(),
+            })
+            .unwrap();
+        handle.await.unwrap();
     }
 }

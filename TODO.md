@@ -13,13 +13,13 @@ Legend: `[ ]` todo, `[/]` in-progress branch, `[x]` done.
 - [x] Merge `feat/skills` cleanly into `dev`
 - [x] Add license (MIT/Apache-2.0), flesh out README + `--help`
 
-### 2. Headless / automation interfaces (TUI-only today)
-- [ ] `rem -p "<prompt>"` print mode (pipe final response to stdout)
-- [ ] `rem exec "<prompt>"` non-interactive run, non-zero exit on error
-- [ ] `--output json|jsonl` event stream (turns, tool calls/results, errors)
-- [ ] Stdin pipe support (`echo ... | rem -p`)
-- [ ] `--yolo` / `--plan` / `--mode <name>` flags for headless runs
-- [ ] `--resume <id>` works headless; fail-open policy flag (`--approve` / `--deny` default)
+### 2. Headless / automation interfaces (grilled 2026-10-06: `-p` only, no `exec`)
+- [x] `rem -p "<prompt>"` print mode (pipe final response to stdout; exit 0/1/2)
+- [x] ~~`rem exec`~~ dropped: one canonical `-p` path (bare positionals hint at `-p`)
+- [x] `--output text|json|jsonl` event stream (tools + result/error; text default)
+- [x] Stdin pipe support (`echo ... | rem -p`; stdin first + `-p` second, either alone)
+- [x] `--mode <name>` single flag only (no `--yolo`/`--plan` shorthands; default `manual`)
+- [x] `--resume <id>` works headless; deny-by-default + `--allow-all` (Confirm→Approve, Deny floor holds)
 
 ### 3. MCP client (`feat/mcp` exists, not landed)
 - [ ] Land `feat/mcp`: MCP client (stdio + SSE/http)
@@ -42,17 +42,17 @@ Legend: `[ ]` todo, `[/]` in-progress branch, `[x]` done.
 - [x] Retry + rate-limit backoff + timeout errors surfaced per-turn
 - [ ] Token meter + `/cost` + `/context` (used/total, compaction point)
 
-### 6. Subagents + task decomposition (single linear loop today)
-- [ ] `TodoWrite` tool (list, status, transcript UI)
-- [ ] `Task` tool: spawn subagent with scoped prompt/tools (even serial queue v1)
-- [ ] Parallel subagent fan-out (bounded) + result merge into parent turn
-- [ ] Background tasks with polling (`/tasks`)
+### 6. Subagents + task decomposition (serial v1 landed 2026-10-07: ADR-0015; parallel + background landed 2026-10-08: ADR-0016)
+- [x] `TodoWrite` tool (list, status, transcript UI)
+- [x] `Task` tool: spawn subagent with scoped prompt/tools (serial queue v1: fresh context, shared approval channel, depth-1 denied-at-schema)
+- [x] Parallel subagent fan-out (bounded) + result merge into parent turn
+- [x] Background tasks with polling (`/tasks`)
 
 ### 7. Checkpoints / undo / rewind (no revert today)
-- [ ] Snapshot `git diff` + `messages_json` before each mutate turn
-- [ ] `/rewind [n]` restores files + history; `/undo` last mutate
-- [ ] Diff-accept flow: show patch, `[a]ccept / [r]eject` before `edit/write` lands
-- [ ] `apply_patch`-style fuzzy edit tool (replace exact-`oldText`-only `edit`)
+- [x] Snapshot `git diff` + `messages_json` before each mutate turn
+- [x] `/rewind [n]` restores files + history; `/undo` last mutate
+- [x] Diff-accept flow: show patch, `[a]ccept / [r]eject` before `edit/write` lands
+- [x] `apply_patch`-style fuzzy edit tool (replace exact-`oldText`-only `edit`)
 
 ## P1 — expected by users
 
