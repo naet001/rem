@@ -143,13 +143,14 @@ Hook order matters: recorder first (observe-all), gate second (steer). `Skip` ke
 ## Development
 
 ```bash
-cargo test   # 141 tests: policy units, hook round-trips, skills, TUI regressions + 2 live web checks (need network)
+cargo test            # offline-green: policy units, hook round-trips, skills, TUI regressions (live web checks ignored)
+cargo test -- --ignored  # opt-in: 2 live web checks (need network)
 cargo fmt --check
-cargo clippy --all-targets
+cargo clippy --all-targets -- -D warnings
 ```
 
 Tests live next to code (`permissions.rs`, `skills.rs`, `tui.rs`, `agent.rs`, `config.rs`, …). The classifier is pure — no I/O, no channels — so policy changes are test-first friendly.
 
 ## License
 
-Currently unlicensed unless otherwise specified.
+Licensed under either of MIT (`LICENSE-MIT`) or Apache-2.0 (`LICENSE-APACHE`) at your option.

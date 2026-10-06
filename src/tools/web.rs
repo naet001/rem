@@ -448,6 +448,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires network access; run with `cargo test -- --ignored`"]
     async fn live_search_returns_numbered_results() {
         let mut ctx = ToolContext::new();
         let out = WebSearchTool
@@ -464,6 +465,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires network access; run with `cargo test -- --ignored`"]
     async fn live_fetch_example_domain_as_text() {
         let mut ctx = ToolContext::new();
         let out = WebFetchTool

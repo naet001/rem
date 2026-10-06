@@ -10,7 +10,7 @@ Legend: `[ ]` todo, `[/]` in-progress branch, `[x]` done.
 ### 1. Fix broken tree + ship baseline
 - [ ] Resolve merge conflicts in `src/agent.rs`, `src/main.rs`, `src/tui.rs` (`feat/skills` markers)
 - [ ] `cargo build`, `cargo test`, `cargo fmt`, `cargo clippy -D warnings` green
-- [ ] Merge `feat/skills` cleanly into `dev`
+- [x] Merge `feat/skills` cleanly into `dev`
 - [ ] Add license (MIT/Apache-2.0), flesh out README + `--help`
 
 ### 2. Headless / automation interfaces (TUI-only today)
