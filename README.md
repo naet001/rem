@@ -22,7 +22,7 @@ The answers, as implemented:
 - **Interrupt, don't kill** — approvals park the worker mid-run over mpsc + oneshot, then resume the same run (ADR-0003).
 - **Modes are presets, not personas** — 5 hard-coded modes, session-local, auditable (ADR-0011).
 - **Reusable knowledge** — Claude-compatible `SKILL.md` bundles with startup index + on-demand bodies (ADR-0013).
-- **Decisions on record** — 18 ADRs in `docs/adr/`, 211 tests, `cargo test` green (minus 2 live web checks that need network).
+- **Decisions on record** — 19 ADRs in `docs/adr/`, 223 tests, `cargo test` green (minus 2 live web checks that need network).
 
 ## Permission verdicts
 
@@ -90,6 +90,26 @@ rem --version    # print version and exit
 rem --resume <id>  # resume a saved session
 ```
 
+## Headless (`rem -p`)
+
+One turn, no TUI — stdout stays pipeable (diagnostics go to stderr):
+
+```bash
+rem -p "explain src/main.rs"                     # print reply to stdout
+rem -p "fix the typo" --mode auto --allow-all  # auto-approve Confirm verdicts
+rem -p "summarize" --output json               # tools + result as one JSON doc
+rem -p "summarize" --output jsonl              # one JSON object per line
+echo "context..." | rem -p "use this"           # stdin (context) + -p (instruction)
+rem -p "continue" --resume <id>                # chain onto a saved session
+```
+
+Rules: `-p` only (no `exec` subcommand). Single `--mode plan|manual|auto|edit|yolo`
+(default `manual`). Deny-by-default: without `--allow-all`, `Confirm` verdicts fail
+closed in-run (model replans); annihilator `Deny` blocks even with `--allow-all`.
+`@path` refs and `/skill:name` invokes expand exactly like the TUI submit path.
+Sessions persist per turn; resume hint goes to stderr so stdout pipes cleanly.
+Exit codes: `0` turn ok, `1` turn/provider/save error, `2` CLI usage error.
+
 ## Slash commands
 
 Full reference — type `/` for the floating menu, `Up`/`Down` to move, `Tab` to complete, `Enter` to run, `Esc` to dismiss:
@@ -155,7 +175,7 @@ Explicit, because a learning project should not oversell:
 
 - **Heuristic, not sandbox.** Bash classification is syntactic (`; && || | & $( )`, quote-stripping). No namespaces, seccomp, or kernel boundary. A determined prompt-injection can shape a command the parser misreads — the human is still the boundary.
 - **No secrets redaction.** Reads return file bytes verbatim in v1.
-- **Local single-user.** The approver is you in the TUI. No remote/multi-user approver, no headless allow (fail-closed to deny when no TUI listens).
+- **Local single-user.** The approver is you in the TUI, or `--allow-all` headless (auto-approve `Confirm`; annihilator `Deny` still holds). Default headless fails closed to deny when no approver listens. No remote/multi-user approver.
 - **`auto`/`edit` still ask a lot.** `cargo test`, `cargo build`, `git push`, redirects, and all network access prompt by design. Use **Allow always** for repeatables.
 
 ## Architecture & docs

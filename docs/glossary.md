@@ -7,7 +7,7 @@
 - **Principal**: The LLM-driven agent loop (`RigAgent`). Untrusted for side effects; all mutations go through the gate.
 - **Gate**: The enforcement point. A Rig `AgentHook::on_tool_call` implementation that classifies every tool call before execution. Single choke point, no tool-side bypass.
 - **Policy**: Pure function `ToolCall -> Verdict`. Decides `Allow | Confirm | Deny` from tool name + args + session rules. No I/O, fully unit-testable.
-- **Approver**: The human in the TUI. The only entity that can resolve a `Confirm` into `Allow | Deny`.
+- **Approver**: The human in the TUI, or the `--allow-all` auto-approver headless (`Confirm` -> `Approve`). The only entities that can resolve a `Confirm` into `Allow | Deny`. Default headless attaches no approver, so `Confirm` fails closed to skip. `Deny` never reaches any approver.
 - **Run**: One `RigAgent::chat()` invocation, which internally may take up to 100 model/tool steps. Approvals must block *inside* the run, never kill it.
 
 ## Verdicts
