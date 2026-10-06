@@ -153,4 +153,4 @@ Tests live next to code (`permissions.rs`, `skills.rs`, `tui.rs`, `agent.rs`, `c
 
 ## License
 
-Licensed under either of MIT (`LICENSE-MIT`) or Apache-2.0 (`LICENSE-APACHE`) at your option.
+MIT — see `LICENSE`.
