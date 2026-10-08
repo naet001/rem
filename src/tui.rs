@@ -1162,7 +1162,7 @@ fn read_at_dir(path: &std::path::Path, display: &str) -> Result<String, String> 
 /// Expand all `@` refs in `text` into fenced content blocks appended after
 /// the original text. On any bad ref, returns `Err` naming the first bad ref.
 /// Root confinement: resolved against `project_root`.
-fn expand_at_refs(text: &str, project_root: &std::path::Path) -> Result<String, String> {
+pub(crate) fn expand_at_refs(text: &str, project_root: &std::path::Path) -> Result<String, String> {
     let refs = scan_at_refs(text);
     if refs.is_empty() {
         return Ok(text.to_string());
@@ -2616,7 +2616,7 @@ fn handle_theme_command(app: &mut App, arg: &str) {
 /// `SKILL.md` bodies with `$ARGUMENTS` substitution. Returns `None` when the
 /// input is not a skill invoke. `Err` names the first unknown skill.
 /// The display short form is the original text (transcript shows `/skill:x`).
-fn expand_skill_invokes(
+pub(crate) fn expand_skill_invokes(
     text: &str,
     agent: &Arc<impl AgentLoop + Send + Sync + 'static>,
 ) -> Result<Option<(String, String)>, String> {
