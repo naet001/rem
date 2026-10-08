@@ -6023,6 +6023,7 @@ mod tests {
         assert_eq!(app.menu_sel, Some(16));
         assert_eq!(app.hist_idx, None);
         assert_eq!(app.input, "/");
+        assert_eq!(app.history, vec!["old turn".to_string()]);
     }
 
     fn print_flat(app: &App) -> String {
