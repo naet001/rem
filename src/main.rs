@@ -1,29 +1,20 @@
 mod agent;
-mod auto_rules;
 mod config;
 mod context;
-mod fs_guard;
 mod headless;
 mod history;
 mod markdown;
 mod mcp;
-mod modes;
-mod permissions;
 mod popup;
-mod rules;
-mod sandbox;
 mod sessions;
-mod settings;
 mod skills;
 mod theme;
 mod tools;
-mod trust;
 mod tui;
 
 use agent::{AgentLoop, RigAgent};
 use config::Config;
 use headless::OutputFormat;
-use modes::Mode;
 use tui::{RatatuiBackend, TuiBackend};
 
 /// `rem --help` text: flags, config, sessions, in-TUI pointers.
@@ -41,10 +32,7 @@ Headless (all flags require -p/--print):
                             pipe stdin too (echo ... | rem -p \"...\");
                             stdin first + -p second, either alone works.
   --resume <id>          continue a saved session headless
-  --mode <name>          auto | default(manual) | acceptEdits | plan | dontAsk | bypassPermissions (default manual)
-  --allow-all            auto-approve Confirm verdicts (Deny floor still holds)
   --output <fmt>         text (default) | json | jsonl event stream
-
 Config: ~/.config/rem/config.toml (see config.example.toml).
   active_provider + [providers.*] entries; keys use env:VAR indirection —
   export OPENAI_API_KEY / ANTHROPIC_API_KEY to match.
@@ -53,7 +41,7 @@ Sessions persist per turn in SQLite under your platform data dir; on exit
 rem prints `Session saved. Resume with: rem --resume <id>` (stderr headless).
 
 Inside the TUI: /quit /new /help /theme /init /resume /rename /fork
-/skills /skill:<name> /model /effort /context, Shift+Tab cycles modes,
+/skills /skill:<name> /model /effort /context,
 @path inlines file/dir contents. Docs: README.md, docs/adr/.";
 
 /// CLI shape: TUI run (fresh or resume) vs headless print vs immediate
@@ -66,8 +54,6 @@ enum Cli {
     Print {
         prompt: Option<String>,
         resume_id: Option<String>,
-        mode: Option<Mode>,
-        allow_all: bool,
         output: OutputFormat,
     },
     Help,
@@ -77,7 +63,7 @@ enum Cli {
 /// Parse `std::env::args` without new deps. `--help`/`--version` win over
 /// everything; unknown `--flags` are fatal. `-p`/`--print` switches to
 /// headless: trailing bare args join into the prompt (stdin supplies the
-/// rest). `--mode` / `--allow-all` / `--output` require `-p`.
+/// rest). `--output` requires `-p`.
 fn parse_cli(args: &[String]) -> Result<Cli, String> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         return Ok(Cli::Help);
@@ -88,8 +74,6 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     let mut print_mode = false;
     let mut prompt_parts: Vec<String> = Vec::new();
     let mut resume_id: Option<String> = None;
-    let mut mode: Option<Mode> = None;
-    let mut allow_all = false;
     let mut output = OutputFormat::Text;
     let mut i = 1;
     while i < args.len() {
@@ -121,27 +105,6 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             }
             resume_id = Some(v.to_string());
             i += 1;
-        } else if a == "--mode" {
-            if i + 1 >= args.len() {
-                return Err(
-                    "--mode requires auto|default|acceptEdits|plan|dontAsk|bypassPermissions"
-                        .to_string(),
-                );
-            }
-            mode =
-                Some(Mode::from_name(&args[i + 1]).ok_or_else(|| {
-                    format!("unknown --mode \"{}\" (see rem --help)", args[i + 1])
-                })?);
-            i += 2;
-        } else if let Some(v) = a.strip_prefix("--mode=") {
-            mode = Some(
-                Mode::from_name(v)
-                    .ok_or_else(|| format!("unknown --mode \"{v}\" (see rem --help)"))?,
-            );
-            i += 1;
-        } else if a == "--allow-all" {
-            allow_all = true;
-            i += 1;
         } else if a == "--output" {
             if i + 1 >= args.len() {
                 return Err("--output requires text|json|jsonl".to_string());
@@ -168,13 +131,11 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         return Ok(Cli::Print {
             prompt,
             resume_id,
-            mode,
-            allow_all,
             output,
         });
     }
-    if mode.is_some() || allow_all || output != OutputFormat::Text {
-        return Err("--mode/--allow-all/--output require -p/--print (see rem --help)".to_string());
+    if output != OutputFormat::Text {
+        return Err("--output requires -p/--print (see rem --help)".to_string());
     }
     if !prompt_parts.is_empty() {
         return Err(format!(
@@ -210,16 +171,12 @@ async fn main() {
     if let Cli::Print {
         prompt,
         resume_id,
-        mode,
-        allow_all,
         output,
     } = cli
     {
         let code = headless::run_print(headless::PrintOpts {
             prompt,
             resume_id,
-            mode,
-            allow_all,
             output,
         })
         .await;
@@ -307,13 +264,11 @@ async fn main() {
     }
     drop(conn);
 
-    let (approval_tx, approval_rx) = permissions::approval_channel();
-
     // Build the agent first so the shared tool registry exists, then
     // connect MCP servers onto it. Warn-and-continue: failures log,
     // the session proceeds on remainder + built-ins. Held connections
     // live in the agent's shared MCP records (process lifetime).
-    let mut agent = match RigAgent::new(&cfg, approval_tx, project_root) {
+    let mut agent = match RigAgent::new(&cfg, project_root) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("rem: {e}");
@@ -347,16 +302,14 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // TUI signature unchanged (src/tui.rs untouched): stash the session
-    // coordinates where phase 3 TUI code can read them.
+    // Stash the session coordinates where TUI code can read them.
     unsafe {
         std::env::set_var("REM_SESSION_ID", &session.id);
         std::env::set_var("REM_SESSIONS_DB", &db_path_str);
         std::env::set_var("REM_SESSION_TITLE", &session.title);
     }
 
-    let run_result = RatatuiBackend::new().run(agent, approval_rx);
-
+    let run_result = RatatuiBackend::new().run(agent);
     // Post-exit cleanup (all quit paths: /quit, Ctrl+D on empty input):
     // run() already tore down raw mode + the inline viewport, so wipe
     // visible screen + scrollback (mirrors launch Clear All+Purge) leaving
@@ -454,8 +407,6 @@ mod tests {
             Ok(Cli::Print {
                 prompt: Some("do stuff".to_string()),
                 resume_id: None,
-                mode: None,
-                allow_all: false,
                 output: OutputFormat::Text,
             })
         );
@@ -464,8 +415,6 @@ mod tests {
             Ok(Cli::Print {
                 prompt: Some("do stuff".to_string()),
                 resume_id: None,
-                mode: None,
-                allow_all: false,
                 output: OutputFormat::Text,
             })
         );
@@ -478,49 +427,30 @@ mod tests {
             Ok(Cli::Print {
                 prompt: None,
                 resume_id: None,
-                mode: None,
-                allow_all: false,
                 output: OutputFormat::Text,
             })
         );
     }
 
     #[test]
-    fn print_parses_mode_allow_all_output_and_resume() {
+    fn print_parses_output_and_resume() {
         assert_eq!(
-            parse_cli(&argv(&[
-                "-p",
-                "hi",
-                "--mode",
-                "auto",
-                "--allow-all",
-                "--output",
-                "json",
-                "--resume",
-                "abc"
-            ])),
+            parse_cli(&argv(&["-p", "hi", "--output", "json", "--resume", "abc"])),
             Ok(Cli::Print {
                 prompt: Some("hi".to_string()),
                 resume_id: Some("abc".to_string()),
-                mode: Some(Mode::Auto),
-                allow_all: true,
                 output: OutputFormat::Json,
             })
         );
     }
 
     #[test]
-    fn print_rejects_unknown_mode_and_output() {
-        assert!(parse_cli(&argv(&["-p", "hi", "--mode", "turbo"])).is_err());
+    fn print_rejects_unknown_output() {
         assert!(parse_cli(&argv(&["-p", "hi", "--output", "yaml"])).is_err());
     }
 
     #[test]
     fn headless_flags_require_print() {
-        let err = parse_cli(&argv(&["--mode", "auto"])).unwrap_err();
-        assert!(err.contains("-p"), "got: {err}");
-        let err = parse_cli(&argv(&["--allow-all"])).unwrap_err();
-        assert!(err.contains("-p"), "got: {err}");
         let err = parse_cli(&argv(&["--output", "json"])).unwrap_err();
         assert!(err.contains("-p"), "got: {err}");
     }

@@ -16,8 +16,6 @@ use rig::{
 use crate::{
     config::{Config, ProviderKind},
     context::Context,
-    modes::Mode,
-    permissions::{ApprovalTx, PermissionHook},
     tools::{
         BackgroundInfo, BackgroundStore, BashTool, EditTool, GitDiffTool, GitStatusTool, GlobTool,
         GrepTool, ListDirectoryTool, ReadTool, TaskChildRunner, TaskTool, TodoItem, TodoWriteTool,
@@ -52,9 +50,6 @@ pub trait AgentLoop {
     /// param. Defaulted for other impls.
     fn effort_name(&self) -> String {
         "medium".to_string()
-    }
-    fn mode_handle(&self) -> Arc<Mutex<Mode>> {
-        Arc::new(Mutex::new(Mode::default()))
     }
     /// Discovered skills for `/skills` list + `/skill:<name>` invoke.
     /// Defaulted so other `AgentLoop` impls report none.
@@ -382,12 +377,11 @@ pub struct RigAgent {
     context: tokio::sync::Mutex<Context>,
     recorder: ToolRecorder,
     /// Active provider + model + effort, mutated live by `/model` and
-    /// `/effort`. Interior-mutable (same `Arc<Mutex>` shape as `mode`)
-    /// so the sync TUI path can switch through `&self`.
+    /// `/effort`. Interior-mutable so the sync TUI path can switch
+    /// through `&self`.
     switch_state: Arc<Mutex<SwitchState>>,
-    mode: Arc<Mutex<Mode>>,
     /// Session todo list, shared with the `todowrite` tool instance.
-    /// Same `Arc<Mutex>` shape as `mode`; cleared on `/new`.
+    /// Cleared on `/new`.
     todos: Arc<Mutex<Vec<TodoItem>>>,
     /// Session background-task store, shared with the `task` tool for
     /// `background:true` detach + with the TUI for `/tasks` + submit-time
@@ -397,7 +391,6 @@ pub struct RigAgent {
     // build time, so reload re-runs `build_inner` with a fresh skill scan.
     cfg: Config,
     project_root: std::path::PathBuf,
-    gate: PermissionHook,
     skills: Arc<Mutex<Vec<crate::skills::Skill>>>,
     // Shared tool registry: 13 static tools + runtime-added MCP tools.
     // Held here (not rebuilt) so `/skills reload` and preamble rebuilds
@@ -438,10 +431,7 @@ fn build_tool_server(
         .tool(WebFetchTool)
         .tool(WebSearchTool)
         .tool(TodoWriteTool::with_shared(todos.clone()))
-        .tool(TaskTool::with_background(
-            Arc::new(task_runner),
-            background,
-        ))
+        .tool(TaskTool::with_background(Arc::new(task_runner), background))
         .run()
 }
 
@@ -476,10 +466,7 @@ fn child_delegation_note(description: &str) -> String {
 /// Production [`TaskChildRunner`]: builds one depth-1 child agent per call
 /// from the parent leg's staged config + live effort, with a fresh
 /// caller-owned [`Context`], fresh recorder, and fresh todo list. The child
-/// gate shares the parent approval channel (same FIFO queue, labeled with
-/// the child description so parallel Confirms attribute) and the
-/// annihilator Deny floor holds, but the child never receives the `task`
-/// tool itself — depth-1 is denied-at-schema, not merely policy.
+/// never receives the `task` tool itself — depth-1 is denied-at-schema.
 /// Inline calls are awaited, never `tokio::spawn`, so aborting the parent
 /// turn cancels the in-flight child future. Only `background:true` detaches
 /// (scoped to the session [`BackgroundStore`]); fan-out itself runs on a
@@ -492,7 +479,6 @@ struct SerialTaskRunner {
     /// runner constructed with the agent stays correct forever.
     cfg: Config,
     live: Arc<Mutex<SwitchState>>,
-    gate: PermissionHook,
     project_root: std::path::PathBuf,
     /// Shared skills snapshot (same Arc the reload path swaps). Child
     /// preamble always reads the current list.
@@ -505,21 +491,16 @@ impl TaskChildRunner for SerialTaskRunner {
     async fn run_child(&self, description: &str, prompt: &str) -> Result<String, String> {
         // Fresh child + fresh Context per attempt: a retryable provider
         // failure rebuilds rather than reusing a half-driven turn.
-        // The child gate is labeled so fan-out Confirms name their child
-        // in the shared FIFO modal; same channel, same Deny floor.
-        let gate = self.gate.with_task_label(description);
         with_retry({
             let this = self.clone();
-            let gate = gate.clone();
             let description = description.to_owned();
             let prompt = prompt.to_owned();
             move |_| {
                 let this = this.clone();
-                let gate = gate.clone();
                 let description = description.clone();
                 let prompt = prompt.clone();
                 async move {
-                    let child = this.build_child_agent(&description, &gate)?;
+                    let child = this.build_child_agent(&description)?;
                     let mut ctx = Context::new();
                     Chat::chat(&child, prompt, ctx.messages_mut())
                         .await
@@ -544,12 +525,7 @@ impl SerialTaskRunner {
     /// the live pointer + live effort + current skills, same preamble +
     /// delegation note, scoped toolset without `task`. Exposed for the
     /// depth-1 schema test via `tool_definitions`.
-    /// `gate` is the labeled child gate (same channel as the parent leg).
-    fn build_child_agent(
-        &self,
-        description: &str,
-        gate: &PermissionHook,
-    ) -> Result<rig::agent::Agent, String> {
+    fn build_child_agent(&self, description: &str) -> Result<rig::agent::Agent, String> {
         let (provider, model, effort) = self
             .live
             .lock()
@@ -566,7 +542,6 @@ impl SerialTaskRunner {
         RigAgent::build_child_inner(
             &staged,
             &effort,
-            gate,
             &recorder,
             &self.project_root,
             &skills,
@@ -587,7 +562,7 @@ fn base_preamble() -> String {
          web_search searches the web (DuckDuckGo, no key), web_fetch reads a URL as text. \
          todowrite owns the session task list: pass the full list each call with content + status (pending/in_progress/completed). \
          task spawns scoped subagent(s): single description (short label) + prompt (full task), or tasks[] array (up to 8 independent subtasks, 4 at a time, merged as ## sections in input order); background:true detaches the call and delivers the summary on a later turn. Children run under the same tools minus task (no recursion). \
-         Bash runs `sh -c` in the project dir (30s timeout). Destructive shell patterns are blocked outright; other mutations and network access ask the human for approval mid-run — if a call is denied, replan without it. \
+         Bash runs `sh -c` in the project dir (30s timeout). \
          Prefer reading a file before editing it. Keep replies concise.",
     )
 }
@@ -719,12 +694,8 @@ fn build_preamble(
 }
 
 impl RigAgent {
-    pub fn new(
-        cfg: &Config,
-        approval_tx: ApprovalTx,
-        project_root: std::path::PathBuf,
-    ) -> Result<Self, String> {
-        Self::new_with_mcp_section(cfg, approval_tx, project_root, "")
+    pub fn new(cfg: &Config, project_root: std::path::PathBuf) -> Result<Self, String> {
+        Self::new_with_mcp_section(cfg, project_root, "")
     }
 
     /// Constructor with a pre-rendered MCP preamble index. The caller
@@ -734,15 +705,11 @@ impl RigAgent {
     /// refreshes it on `/mcp` toggles.
     pub fn new_with_mcp_section(
         cfg: &Config,
-        approval_tx: ApprovalTx,
         project_root: std::path::PathBuf,
         mcp_section: &str,
     ) -> Result<Self, String> {
         let recorder = ToolRecorder::default();
-        let mode = Arc::new(Mutex::new(Mode::default()));
         let todos: Arc<Mutex<Vec<TodoItem>>> = Arc::new(Mutex::new(Vec::new()));
-        // Observer first (see everything), gate second (steers). ADR-0001.
-        let gate = PermissionHook::new(approval_tx, project_root.clone(), mode.clone());
         let skills = crate::skills::discover(&project_root);
         let skills_shared = Arc::new(Mutex::new(skills.clone()));
         let background: Arc<BackgroundStore> = Arc::new(BackgroundStore::new());
@@ -757,7 +724,7 @@ impl RigAgent {
             effort: effort.clone(),
         }));
         // `task` runner for the parent leg: wired to the live
-        // provider/model/effort pointer + shared gate + project root +
+        // provider/model/effort pointer + project root +
         // shared skills + store, so `/model`, `/effort`, and
         // `/skills reload` rebuilds never touch it. Registered once on
         // the shared handle below; the child built per call never
@@ -765,7 +732,6 @@ impl RigAgent {
         let task_runner = SerialTaskRunner {
             cfg: cfg.clone(),
             live: switch_state.clone(),
-            gate: gate.clone(),
             project_root: project_root.clone(),
             skills: skills_shared.clone(),
             background: background.clone(),
@@ -774,7 +740,6 @@ impl RigAgent {
         let agent = Self::build_inner(
             &staged,
             &effort,
-            &gate,
             &recorder,
             &project_root,
             &skills,
@@ -787,12 +752,10 @@ impl RigAgent {
             context: tokio::sync::Mutex::new(Context::new()),
             recorder,
             switch_state,
-            mode,
             todos,
             background,
             cfg: cfg.clone(),
             project_root,
-            gate,
             skills: skills_shared,
             tool_handle,
             mcp_section: std::sync::Mutex::new(mcp_section.to_string()),
@@ -823,7 +786,6 @@ impl RigAgent {
     fn build_inner(
         effective: &Config,
         effort: &str,
-        gate: &PermissionHook,
         recorder: &ToolRecorder,
         project_root: &std::path::Path,
         skills: &[crate::skills::Skill],
@@ -886,7 +848,6 @@ impl RigAgent {
             .default_max_turns(100)
             .additional_params(additional_params)
             .add_hook(recorder.clone())
-            .add_hook(gate.clone())
             .build();
 
         Ok(agent)
@@ -896,14 +857,13 @@ impl RigAgent {
     /// [`RigAgent::build_inner`] plus the delegation note, scoped toolset
     /// (same 11 file/shell/git/search/web tools + `todowrite`, never `task` —
     /// so 12 in the child vs 13 in the parent),
-    /// same 100-turn budget, fresh recorder + gate + todos from the caller.
+    /// same 100-turn budget, fresh recorder + todos from the caller.
     /// The parent leg passes its own `task` runner separately — the child
     /// never receives one.
     #[allow(clippy::too_many_arguments)]
     fn build_child_inner(
         effective: &Config,
         effort: &str,
-        gate: &PermissionHook,
         recorder: &ToolRecorder,
         project_root: &std::path::Path,
         skills: &[crate::skills::Skill],
@@ -978,7 +938,6 @@ impl RigAgent {
             .default_max_turns(100)
             .additional_params(additional_params)
             .add_hook(recorder.clone())
-            .add_hook(gate.clone())
             .build();
         Ok(agent)
     }
@@ -991,7 +950,6 @@ impl RigAgent {
         SerialTaskRunner {
             cfg: self.cfg.clone(),
             live: self.switch_state.clone(),
-            gate: self.gate.clone(),
             project_root: self.project_root.clone(),
             skills: self.skills.clone(),
             background: self.background.clone(),
@@ -999,13 +957,12 @@ impl RigAgent {
     }
 
     /// Test seam: build the serial child for `description` from the live
-    /// leg (staged config snapshot + live effort + shared gate). The
+    /// leg (staged config snapshot + live effort). The
     /// depth-1 schema test asserts on `tool_definitions` — never `task`.
     #[cfg(test)]
     fn build_serial_child(&self, description: &str) -> Result<rig::agent::Agent, String> {
         let runner = self.test_task_runner();
-        let gate = self.gate.with_task_label(description);
-        runner.build_child_agent(description, &gate)
+        runner.build_child_agent(description)
     }
 
     /// Provider-qualified tag for the footer and Session record
@@ -1062,7 +1019,6 @@ impl RigAgent {
         let rebuilt = Self::build_inner(
             &staged,
             &effort,
-            &self.gate,
             &self.recorder,
             &self.project_root,
             &fresh,
@@ -1098,7 +1054,6 @@ impl RigAgent {
         let rebuilt = Self::build_inner(
             &staged,
             &effort,
-            &self.gate,
             &self.recorder,
             &self.project_root,
             &fresh,
@@ -1239,9 +1194,6 @@ impl AgentLoop for RigAgent {
             .map(|s| s.effort.clone())
             .unwrap_or_else(|_| "medium".to_string())
     }
-    fn mode_handle(&self) -> Arc<Mutex<Mode>> {
-        self.mode.clone()
-    }
     fn list_todos(&self) -> Vec<TodoItem> {
         self.todos.lock().map(|g| g.clone()).unwrap_or_default()
     }
@@ -1376,7 +1328,7 @@ impl AgentLoop for RigAgent {
         result
     }
     /// Re-scan skill dirs + rebuild the inner `Agent` so subsequent turns see
-    /// new/edited skills. History (`Context`), recorder, gate allows, mode,
+    /// new/edited skills. History (`Context`), recorder,
     /// switch state, and the shared todo list survive (same Arcs reused).
     /// Fail-closed: rebuild error keeps old agent.
     /// Caller (TUI) must refuse while a turn is in-flight (`app.busy`).
@@ -1399,7 +1351,6 @@ impl AgentLoop for RigAgent {
         let rebuilt = Self::build_inner(
             &staged,
             &effort,
-            &self.gate,
             &self.recorder,
             &self.project_root,
             &fresh,
@@ -1429,9 +1380,8 @@ impl AgentLoop for RigAgent {
 
     /// Switch the active provider/model mid-Session. `spec` is `model`
     /// (same provider) or `provider:model` (cross provider). Rebuilds the
-    /// inner `Agent` reusing the Gate, recorder, mode, and skills;
-    /// caller-owned history is preserved. Fail-closed: rebuild errors keep
-    /// the old agent. Refuses empty specs and unknown providers.
+    /// inner `Agent` reusing the recorder and skills; caller-owned
+    /// history is preserved. Fail-closed: rebuild errors keep the old agent.
     /// Returns the new `provider:model` tag.
     /// Caller (TUI) must refuse while a turn is in-flight (`app.busy`).
     fn switch_model_sync(&self, spec: &str) -> Result<String, String> {
@@ -1475,7 +1425,6 @@ impl AgentLoop for RigAgent {
         let rebuilt = Self::build_inner(
             &staged,
             &cur_effort,
-            &self.gate,
             &self.recorder,
             &self.project_root,
             &skills_snapshot,
@@ -1526,7 +1475,6 @@ impl AgentLoop for RigAgent {
         let rebuilt = Self::build_inner(
             &staged,
             &effort,
-            &self.gate,
             &self.recorder,
             &self.project_root,
             &skills_snapshot,
@@ -1703,11 +1651,10 @@ default_model = "gpt-4o"
         use rig::tool::DynamicTool;
         set_test_key_vars();
         let cfg = mcp_test_config();
-        let (tx, _rx) = crate::permissions::approval_channel();
         let dir = std::env::temp_dir().join("rem-mcp-test-reload-xyz");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let agent = RigAgent::new(&cfg, tx, dir.clone()).expect("agent");
+        let agent = RigAgent::new(&cfg, dir.clone()).expect("agent");
         // Simulate an MCP registration landing on the shared handle.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1758,11 +1705,10 @@ default_model = "gpt-4o"
     async fn live_mcp_panel_bridge_lists_and_rejects_unknown() {
         set_test_key_vars();
         let cfg = mcp_test_config();
-        let (tx, _rx) = crate::permissions::approval_channel();
         let dir = std::env::temp_dir().join("rem-mcp-test-panel-bridge-xyz");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let agent = RigAgent::new(&cfg, tx, dir.clone()).expect("agent");
+        let agent = RigAgent::new(&cfg, dir.clone()).expect("agent");
         // Empty state: panel lists nothing, toggle rejects unknown.
         assert!(agent.list_mcp_servers().is_empty());
         let err = agent
@@ -1778,11 +1724,10 @@ default_model = "gpt-4o"
     async fn live_mcp_login_logout_bridge() {
         set_test_key_vars();
         let cfg = mcp_test_config();
-        let (tx, _rx) = crate::permissions::approval_channel();
         let dir = std::env::temp_dir().join("rem-mcp-test-login-bridge-xyz");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let agent = RigAgent::new(&cfg, tx, dir.clone()).expect("agent");
+        let agent = RigAgent::new(&cfg, dir.clone()).expect("agent");
         // Unknown server: login + logout both error naming it.
         let err = agent.mcp_login("nope").expect_err("unknown login");
         assert!(err.contains("nope"), "got: {err}");
@@ -1920,8 +1865,7 @@ default_model = "claude-sonnet-4-5"
         let dir = std::env::temp_dir().join("rem-test-switch-agent");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (tx, _rx) = crate::permissions::approval_channel();
-        RigAgent::new(&test_config(), tx, dir).unwrap()
+        RigAgent::new(&test_config(), dir).unwrap()
     }
 
     /// Make `dir` a git repo with one committed file (the undo fixture).
@@ -1965,8 +1909,7 @@ default_model = "claude-sonnet-4-5"
         let dir = std::env::temp_dir().join(format!("rem-test-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (tx, _rx) = crate::permissions::approval_channel();
-        RigAgent::new(&test_config(), tx, dir).unwrap()
+        RigAgent::new(&test_config(), dir).unwrap()
     }
 
     #[tokio::test]
@@ -2224,18 +2167,6 @@ default_model = "claude-sonnet-4-5"
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>(),
-        );
-    }
-
-    #[test]
-    fn serial_child_shares_parent_approval_channel() {
-        // Serialized approvals: the child gate must park Confirm verdicts
-        // on the same channel the Approver already answers.
-        let agent = test_agent();
-        let runner = agent.test_task_runner();
-        assert!(
-            runner.gate.shares_approval_channel(&agent.gate),
-            "child gate must share the parent approval channel"
         );
     }
 
