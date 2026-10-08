@@ -1,8 +1,8 @@
 mod agent;
 mod auto_rules;
 mod config;
-mod fs_guard;
 mod context;
+mod fs_guard;
 mod headless;
 mod history;
 mod markdown;
@@ -41,7 +41,7 @@ Headless (all flags require -p/--print):
                             pipe stdin too (echo ... | rem -p \"...\");
                             stdin first + -p second, either alone works.
   --resume <id>          continue a saved session headless
-  --mode <name>          plan | manual | auto | edit | yolo (default manual)
+  --mode <name>          auto | default(manual) | acceptEdits | plan | dontAsk | bypassPermissions (default manual)
   --allow-all            auto-approve Confirm verdicts (Deny floor still holds)
   --output <fmt>         text (default) | json | jsonl event stream
 
@@ -123,7 +123,10 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             i += 1;
         } else if a == "--mode" {
             if i + 1 >= args.len() {
-                return Err("--mode requires plan|manual|auto|edit|yolo".to_string());
+                return Err(
+                    "--mode requires auto|default|acceptEdits|plan|dontAsk|bypassPermissions"
+                        .to_string(),
+                );
             }
             mode =
                 Some(Mode::from_name(&args[i + 1]).ok_or_else(|| {

@@ -2469,7 +2469,7 @@ fn handle_key(
             if let Ok(mut mode) = agent.mode_handle().lock() {
                 *mode = next;
             }
-            app.enqueue_notice(format!("permission mode: {}", next.name()));
+            app.enqueue_notice(format!("permission mode: {}", next.label()));
         }
         KeyCode::Tab | KeyCode::BackTab => {}
         KeyCode::Backspace => {
@@ -4355,7 +4355,7 @@ fn render_footer(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
     let spans = vec![
         Span::raw("  "),
         Span::styled(
-            format!("▶ {}", app.mode.name()),
+            app.mode.footer_text(),
             Style::default().fg(app.theme.accent),
         ),
         Span::styled(format!("  ·  {}", app.model), faint),

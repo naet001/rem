@@ -710,8 +710,7 @@ impl RigAgent {
                 .switch_state
                 .lock()
                 .map_err(|_| "agent busy, try again".to_string())?;
-            let staged =
-                staged_config(&self.cfg, &state.provider, &state.model, &state.effort)?;
+            let staged = staged_config(&self.cfg, &state.provider, &state.model, &state.effort)?;
             (staged, state.effort.clone())
         };
         let rebuilt = Self::build_inner(
@@ -747,8 +746,7 @@ impl RigAgent {
                 .switch_state
                 .lock()
                 .map_err(|_| "agent busy, try again".to_string())?;
-            let staged =
-                staged_config(&self.cfg, &state.provider, &state.model, &state.effort)?;
+            let staged = staged_config(&self.cfg, &state.provider, &state.model, &state.effort)?;
             (staged, state.effort.clone())
         };
         let rebuilt = Self::build_inner(

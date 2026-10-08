@@ -103,7 +103,7 @@ pub fn classify_mode(
             reason: format!("mode `plan` is read-only; `{tool_name}` is not permitted"),
         };
     }
-    if mode == Mode::Yolo && tool_name != "bash" {
+    if mode == Mode::BypassPermissions && tool_name != "bash" {
         return Verdict::Allow;
     }
     match tool_name {
@@ -114,14 +114,19 @@ pub fn classify_mode(
             Mode::Manual => Verdict::Confirm {
                 reason: "manual mode requires approval".into(),
             },
-            Mode::Auto | Mode::Edit | Mode::Yolo => classify_mutate(tool_name, args, project_root),
+            Mode::Auto => classify_mutate(tool_name, args, project_root),
             Mode::Plan => unreachable!(),
+            Mode::AcceptEdits => classify_mutate(tool_name, args, project_root),
+            Mode::DontAsk => Verdict::Confirm {
+                reason: "dontAsk mode: write/edit needs approval".into(),
+            },
+            Mode::BypassPermissions => Verdict::Allow,
         },
         // Shell: the whole threat model lives here.
         "bash" => classify_bash(args),
         // Network tools: approval per user spec.
         "web_fetch" => {
-            if mode == Mode::Yolo {
+            if mode == Mode::BypassPermissions {
                 Verdict::Allow
             } else {
                 Verdict::Confirm {
@@ -130,7 +135,7 @@ pub fn classify_mode(
             }
         }
         "web_search" => {
-            if mode == Mode::Yolo {
+            if mode == Mode::BypassPermissions {
                 Verdict::Allow
             } else {
                 Verdict::Confirm {
@@ -1045,7 +1050,7 @@ mod tests {
             "mcp__github__create_issue",
             &args(serde_json::json!({})),
             &root(),
-            Mode::Yolo,
+            Mode::BypassPermissions,
         );
         assert_eq!(v, Verdict::Allow);
         let v = classify_mode(
