@@ -112,6 +112,17 @@ Full reference — type `/` for the floating menu, `Up`/`Down` to move, `Tab` to
 
 Keys: `Enter` submit, `Shift+Enter` or `Ctrl+O` newline, `Esc` interrupt a run (second `Esc` clears input), `Ctrl+C` clear, `Shift+Tab` cycle mode, `j/k`, `Up/Down`, `Ctrl+d/u` in popups.
 
+## File refs (`@` mentions)
+
+Point at project files from the composer — content is inlined into the model payload, transcript keeps the short form:
+
+- `@src/main.rs` inlines the file (capped at 2000 chars with a `[truncated N chars]` note)
+- `@src/` inlines a non-recursive `file:`/`dir:` listing (500 entries, same shape as `list_directory`)
+- `@src/main.rs:10-20` inlines lines 10–20 with line numbers; `@src/main.rs:42` one line; `@src/main.rs:100-` to end of file (end past EOF clamps)
+- Multiple refs expand in appearance order: `compare @a.rs:1-10 with @b.rs`
+- Bad refs block submit and name the ref: missing, unreadable, binary, outside-root (`../`, absolute, symlink escapes), invalid ranges (`20-10`, `0`, past-EOF start), range-on-directory
+- `@` completes via fuzzy popup (`Tab`/`Enter` accept, range suffix preserved, `Esc` dismisses); `/`-menu wins on slash lines; reads never pop the approval modal
+
 ## Skills (compact)
 
 Claude-compatible `<name>/SKILL.md` bundles (YAML frontmatter `description` + Markdown body + sibling files). Identity is the folder name; malformed files load leniently (name-only + note) instead of breaking startup.
