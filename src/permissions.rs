@@ -80,7 +80,7 @@ pub const FAST_PATH_MAX_BYTES: usize = 32 * 1024;
 /// Classify one tool call. Pure: no I/O, no channel access.
 /// Legacy default policy (ADR-0002): equivalent to `Auto` — small
 /// in-project non-sensitive mutations take the fast-path. Session-scoped
-/// gating (Manual/Plan/Yolo) goes through [`classify_mode`].
+/// gating (Manual/Plan/BypassPermissions) goes through [`classify_mode`].
 /// Unit tests exercise this; production uses [`classify_mode`].
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn classify(tool_name: &str, args: &serde_json::Value, project_root: &Path) -> Verdict {
@@ -145,8 +145,8 @@ pub fn classify_mode(
         }
         // MCP tools (Claude `mcp__server__tool` names): Confirm
         // by default — defense-in-depth over the unknown-tool fallthrough,
-        // plus explicit Yolo/Plan semantics. Plan already denied above,
-        // Yolo already allowed above.
+        // plus explicit BypassPermissions/Plan semantics. Plan already denied above,
+        // BypassPermissions already allowed above.
         _ if tool_name.starts_with("mcp__") => Verdict::Confirm {
             reason: format!("third-party MCP tool `{tool_name}` needs approval"),
         },
