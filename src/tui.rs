@@ -237,11 +237,17 @@ const PICKER_VIEWPORT_ROWS: u16 = 14;
 /// Max session rows visible in the picker box; beyond this the list windows.
 const MAX_PICKER_ROWS: usize = 8;
 fn viewport_height(app: &App, width: u16, height: u16) -> u16 {
+    // Docked menu strip (+session picker) grows the viewport upward;
+    // the composer stays bottom-anchored and transcript stays visible above.
     let pane = app.pane_height(width);
+    let docked = docked_menu_height(app);
     if app.session_picker.is_some() {
-        PICKER_VIEWPORT_ROWS.min(height).max(pane.min(height))
+        PICKER_VIEWPORT_ROWS
+            .min(height)
+            .max(pane.min(height))
+            .max((pane + docked).min(height))
     } else {
-        pane
+        (pane + docked).min(height).max(pane.min(height))
     }
 }
 
@@ -1323,17 +1329,47 @@ fn is_menu_live(app: &App) -> bool {
 }
 
 fn menu_status_height(_app: &App) -> u16 {
-    // Float box needs no pane rows. Status row always stays.
+    // Status row always stays (busy/approval/idle blank).
     1
+}
+
+/// Visible docked rows for a total count: capped at the 10-row budget.
+/// Overflow replaces the last row with `+N more`, so visible == min(total, max).
+fn docked_visible_rows(total: usize) -> usize {
+    total.min(MENU_MAX_ROWS.min(10))
+}
+
+/// Slash-menu total rows at caret (all modes). 0 when closed.
+fn slash_docked_total(app: &App) -> usize {
+    match menu_live(&app.input, app.cursor, &app.skill_names, &app.model_names) {
+        MenuLive::Closed => 0,
+        MenuLive::Commands { cmds, .. } => cmds.len(),
+        MenuLive::Themes { names, .. } => names.len(),
+        MenuLive::Models { names, .. } => names.len(),
+        MenuLive::Efforts { names, .. } => names.len(),
+        MenuLive::Skills { names, .. } => names.len(),
+    }
+}
+
+/// Docked menu height in rows (no border): slash wins, else @.
+/// Zero while a blocking modal owns the screen (approval / picker).
+fn docked_menu_height(app: &App) -> u16 {
+    if !app.pending_approvals.is_empty() || app.session_picker.is_some() {
+        return 0;
+    }
+    let slash = slash_docked_total(app);
+    if slash > 0 {
+        return docked_visible_rows(slash) as u16;
+    }
+    // @ menu (suppressed when `/` has rows, busy, or approval pending
+    // by construction in `at_row_count`).
+    docked_visible_rows(at_row_count(app)) as u16
 }
 
 #[cfg(test)]
 fn menu_height(app: &App) -> u16 {
-    // Zero: float box draws over pane, takes no layout rows.
-    match is_menu_open(app) || is_menu_live(app) {
-        true => 0,
-        false => 0,
-    }
+    // Docked strip takes real layout rows above the composer.
+    docked_menu_height(app)
 }
 
 // ---------------------------------------------------------------------------
@@ -3231,13 +3267,14 @@ impl App {
     }
 
     fn pane_height(&self, term_width: u16) -> u16 {
+        // Base chrome: gap(1) + status(1) + input band + footer(1).
         PANE_ROWS.saturating_add(self.visible_input_lines(term_width).saturating_sub(1) as u16)
     }
 
     fn input_band_height(&self, term_width: u16, _menu_open: bool) -> u16 {
         // Ruled composer: 1 top bar + visible text lines + 1 bottom bar.
         // Both bars are always present so the input zone reads as a framed
-        // band; the float menu never steals layout rows.
+        // band; the docked menu takes its own layout rows above.
         let lines = self.visible_input_lines(term_width) as u16;
         lines + 2
     }
@@ -3482,12 +3519,14 @@ fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
     render_pane_in(f, app, area, true);
 }
 
-/// Bottom-pane chrome (gap + status + input + footer) painted into
-/// `area`. All popups float over the pane: slash menu (float box above
-/// input), session box, approval box. Viewport stays small, chat safe.
+/// Bottom-pane chrome (gap + status + docked menu + input + footer) painted
+/// into `area`. The slash/@ menu is a borderless full-width strip docked
+/// directly above the composer (reference: `› /name  desc` rows, no box,
+/// no fill); approval + session picker still float as boxes over the pane.
+/// Viewport stays small, chat safe.
 fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals: bool) {
-    let required_height = app.pane_height(area.width);
-    if area.width < 20 || area.height < required_height {
+    let base_height = app.pane_height(area.width);
+    if area.width < 20 || area.height < base_height {
         f.render_widget(
             Paragraph::new(Line::from("terminal too small — resize to continue")),
             area,
@@ -3497,10 +3536,15 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
     let menu_open = is_menu_open(app) || is_menu_live(app);
     let status_h = menu_status_height(app);
     let input_h = app.input_band_height(area.width, menu_open);
+    // Docked menu takes real rows above the composer so it never covers
+    // input; clamp to what fits above the compact pane on tiny screens.
+    let menu_full = docked_menu_height(app);
+    let menu_h = menu_full.min(area.height.saturating_sub(base_height));
     // Bottom-anchor the pane chrome: in the compact viewport pane_area ==
-    // area, but when the picker expands the viewport the composer stays on
-    // the bottom rows just above the footer and the modal floats above it.
-    let required = required_height.min(area.height);
+    // area, but when the menu (or picker) expands the viewport the composer
+    // stays on the bottom rows just above the footer and the menu strip
+    // sits directly above the composer's top rule.
+    let required = base_height.saturating_add(menu_h).min(area.height);
     let pane_area = Rect::new(
         area.x,
         area.y + area.height.saturating_sub(required),
@@ -3512,6 +3556,7 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
         .constraints([
             Constraint::Length(1),        // gap (terminal bg)
             Constraint::Length(status_h), // status (busy/approval/idle)
+            Constraint::Length(menu_h),   // docked slash/@ menu (0 when closed)
             Constraint::Length(input_h),  // ruled composer (bars + text)
             Constraint::Length(1),        // footer
         ])
@@ -3519,11 +3564,10 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
 
     render_gap(f, chunks[0]);
     render_status(f, app, chunks[1]);
+    render_menu_docked(f, app, chunks[2]);
     app.sync_input_scroll((area.width as usize).saturating_sub(4));
-    render_input(f, app, chunks[2]);
-    render_footer(f, app, chunks[3]);
-    // Float slash menu over pane, above input line.
-    render_menu_float(f, app, area);
+    render_input(f, app, chunks[3]);
+    render_footer(f, app, chunks[4]);
     // Modal float area: everything above the footer row of the full area.
     // Box bottom-anchors here (see popup::render_float), covering the
     // composer while open; footer stays visible below.
@@ -3562,7 +3606,7 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
     // the resized composer and input scroll, which the sessions-side
     // `cursor_x` single-line path did not.
     if app.session_picker.is_none() && app.pending_approvals.is_empty() {
-        f.set_cursor_position(cursor_position(app, chunks[2]));
+        f.set_cursor_position(cursor_position(app, chunks[3]));
     }
 }
 
@@ -3942,26 +3986,27 @@ fn render_status(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
     f.render_widget(Paragraph::new(Line::from("")), area);
 }
 
-/// Slash-menu float box above input. Small box with thin border.
-/// Mid-input case 1: `/` after space or at start. Gray `[hint]` after space.
-/// `▸ /name  desc` rows, `▸ <theme>` rows in theme mode, `▸ <skill>` rows
-/// in skill mode (`/skill:<partial>`, from the skills cache). Cap 10 +
-/// `+N more`. Old pane-row slot now draws nothing (area height is 0).
-/// Float draws in `render_pane_in` after input, so box sits above input line.
-/// Float slash menu. Small box with border, above input line.
-/// Same rows as old band, but in float box. Gray hint text included.
-fn render_menu_float(f: &mut ratatui::Frame, app: &App, area: Rect) {
+/// Slash-menu docked strip directly above the composer. Borderless
+/// full-width rows on the terminal background (reference screenshot).
+/// Mid-input case 1: `/` after space or at start. Gray hint after space.
+/// `› /name  desc` rows (two-column padded), `› <name>` rows in
+/// theme/model/effort/skill modes. Cap 10 + `+N more`. Takes real layout
+/// rows in `render_pane_in` so it never covers input.
+fn render_menu_docked(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
     let live = menu_live(&app.input, app.cursor, &app.skill_names, &app.model_names);
-    // Mode tag: skill rows render like theme rows (`▸ <name>`).
-    let (mode, total) = match &live {
-        MenuLive::Commands { cmds, .. } => ("cmds", cmds.len()),
-        MenuLive::Themes { names, .. } => ("themes", names.len()),
-        MenuLive::Models { names, .. } => ("models", names.len()),
-        MenuLive::Efforts { names, .. } => ("efforts", names.len()),
-        MenuLive::Skills { names, .. } => ("skills", names.len()),
+    // Mode tag: skill rows render like theme rows (`› <name>`).
+    let total = match &live {
+        MenuLive::Commands { cmds, .. } => cmds.len(),
+        MenuLive::Themes { names, .. } => names.len(),
+        MenuLive::Models { names, .. } => names.len(),
+        MenuLive::Efforts { names, .. } => names.len(),
+        MenuLive::Skills { names, .. } => names.len(),
         MenuLive::Closed => {
-            // @-mention menu (ADR-0012): renders in the same float slot
-            // when the `/` menu is closed. Same chrome, same float box.
+            // @-mention menu (ADR-0012): renders in the same docked slot
+            // when the `/` menu is closed. Same borderless chrome.
             render_at_menu(f, app, area);
             return;
         }
@@ -3984,206 +4029,120 @@ fn render_menu_float(f: &mut ratatui::Frame, app: &App, area: Rect) {
             .saturating_sub(show_rows - 1)
             .min(total.saturating_sub(show_rows)),
     };
-    // Box height = rows + overflow row? + border (2).
-    let mut h = show_rows as u16 + 2;
-    if has_overflow {
-        h += 1;
+    // One owned row per match: (name, desc, hint). Single-column modes
+    // leave desc/hint empty; `●` marks the live theme/model/effort value.
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+    match &live {
+        MenuLive::Commands { cmds, .. } => {
+            for cmd in cmds {
+                rows.push((
+                    format!("/{}", cmd.name),
+                    cmd.desc.to_string(),
+                    cmd.hint.to_string(),
+                ));
+            }
+        }
+        MenuLive::Themes { names, .. } => {
+            for name in names {
+                let label = match *name == app.theme.name {
+                    true => format!("{name}  ●"),
+                    false => (*name).clone(),
+                };
+                rows.push((label, String::new(), String::new()));
+            }
+        }
+        MenuLive::Models { names, .. } => {
+            for name in names {
+                let label = match *name == app.model {
+                    true => format!("{name}  ●"),
+                    false => (*name).clone(),
+                };
+                rows.push((label, String::new(), String::new()));
+            }
+        }
+        MenuLive::Efforts { names, .. } => {
+            for name in names {
+                let label = match *name == app.effort {
+                    true => format!("{name}  ●"),
+                    false => (*name).clone(),
+                };
+                rows.push((label, String::new(), String::new()));
+            }
+        }
+        MenuLive::Skills { names, .. } => {
+            for name in names {
+                rows.push(((*name).clone(), String::new(), String::new()));
+            }
+        }
+        MenuLive::Closed => {}
     }
-    let inner = crate::popup::render_float(f, area, h, 64, theme);
-    if inner.width < 20 {
-        return;
-    }
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    // Hint row: gray `[hint]` of top pick when token done (space after).
-    // Live token has no space yet, so hint shows for full-name match.
-    let mk_row =
-        |selected: bool, marker: Span<'static>, body: Vec<Span<'static>>| -> Line<'static> {
-            let row_style = match selected {
-                true => Style::default().bg(theme.menu_sel_bg),
-                false => Style::default().bg(theme.pane_bg),
-            };
-            let mut spans = vec![marker];
-            spans.extend(body);
-            let mut line = Line::from(spans);
-            line.style = row_style;
-            line
-        };
-    let sel_style = |selected: bool| -> Style {
+    // Borderless rows: no fill anywhere, so the terminal background shows
+    // through (reference screenshot). Only the selected name carries the
+    // accent; descriptions stay faint.
+    let marker = |selected: bool| -> Span<'static> {
+        match selected {
+            true => Span::styled(
+                "› ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            false => Span::raw("  "),
+        }
+    };
+    let name_style = |selected: bool| -> Style {
         match selected {
             true => Style::default()
                 .fg(theme.accent)
-                .add_modifier(Modifier::BOLD)
-                .bg(theme.menu_sel_bg),
-            false => Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
+                .add_modifier(Modifier::BOLD),
+            false => Style::default().fg(Color::Gray),
         }
     };
-    if mode == "themes" {
-        let MenuLive::Themes { names, .. } = &live else {
-            return;
-        };
-        for (i, name) in names.iter().enumerate().skip(start).take(show_rows) {
-            let selected = i == sel;
-            let marker = match selected {
-                true => Span::styled(
-                    "▸ ",
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD)
-                        .bg(theme.menu_sel_bg),
-                ),
-                false => Span::styled("  ", Style::default().bg(theme.pane_bg)),
-            };
-            let is_current = *name == app.theme.name;
-            let label = match is_current {
-                true => format!("{name}  ●"),
-                false => name.clone(),
-            };
-            lines.push(mk_row(
-                selected,
-                marker,
-                vec![Span::styled(label, sel_style(selected))],
-            ));
-        }
-    } else if mode == "models" {
-        let MenuLive::Models { names, .. } = &live else {
-            return;
-        };
-        // Model rows render like theme rows (`▸ <combo>`); Tab/Enter
-        // completes the full `provider:model` combo. The live combo
-        // (matching the footer tag) gets the current marker.
-        for (i, name) in names.iter().enumerate().skip(start).take(show_rows) {
-            let selected = i == sel;
-            let marker = match selected {
-                true => Span::styled(
-                    "▸ ",
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD)
-                        .bg(theme.menu_sel_bg),
-                ),
-                false => Span::styled("  ", Style::default().bg(theme.pane_bg)),
-            };
-            let is_current = *name == app.model;
-            let label = match is_current {
-                true => format!("{name}  ●"),
-                false => name.clone(),
-            };
-            lines.push(mk_row(
-                selected,
-                marker,
-                vec![Span::styled(label, sel_style(selected))],
-            ));
-        }
-    } else if mode == "efforts" {
-        let MenuLive::Efforts { names, .. } = &live else {
-            return;
-        };
-        // Effort rows render like theme rows (`▸ <level>`); the live
-        // level (matching the footer) gets the current marker.
-        for (i, name) in names.iter().enumerate().skip(start).take(show_rows) {
-            let selected = i == sel;
-            let marker = match selected {
-                true => Span::styled(
-                    "▸ ",
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD)
-                        .bg(theme.menu_sel_bg),
-                ),
-                false => Span::styled("  ", Style::default().bg(theme.pane_bg)),
-            };
-            let is_current = *name == app.effort;
-            let label = match is_current {
-                true => format!("{name}  ●"),
-                false => name.clone(),
-            };
-            lines.push(mk_row(
-                selected,
-                marker,
-                vec![Span::styled(label, sel_style(selected))],
-            ));
-        }
-    } else if mode == "skills" {
-        let MenuLive::Skills { names, .. } = &live else {
-            return;
-        };
-        // Skill rows render like theme rows (`▸ <name>`); Tab/Enter
-        // completes the full `/skill:<name>` invokable form.
-        for (i, name) in names.iter().enumerate().skip(start).take(show_rows) {
-            let selected = i == sel;
-            let marker = match selected {
-                true => Span::styled(
-                    "▸ ",
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD)
-                        .bg(theme.menu_sel_bg),
-                ),
-                false => Span::styled("  ", Style::default().bg(theme.pane_bg)),
-            };
-            lines.push(mk_row(
-                selected,
-                marker,
-                vec![Span::styled(name.clone(), sel_style(selected))],
-            ));
-        }
-    } else {
-        let MenuLive::Commands { cmds, .. } = &live else {
-            return;
-        };
-        for (i, cmd) in cmds.iter().enumerate().skip(start).take(show_rows) {
-            let selected = i == sel;
-            let marker = match selected {
-                true => Span::styled(
-                    "▸ ",
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD)
-                        .bg(theme.menu_sel_bg),
-                ),
-                false => Span::styled("  ", Style::default().bg(theme.pane_bg)),
-            };
-            let mut body = vec![Span::styled(format!("/{}", cmd.name), sel_style(selected))];
-            body.push(Span::styled(
-                format!("  {}", cmd.desc),
-                Style::default().fg(Color::DarkGray).bg(match selected {
-                    true => theme.menu_sel_bg,
-                    false => theme.pane_bg,
-                }),
-            ));
-            // Gray hint when cmd takes arg (shows what to type next).
-            if !cmd.hint.is_empty() {
-                body.push(Span::styled(
-                    format!("  {}", cmd.hint),
+    let desc_style = Style::default().fg(Color::DarkGray);
+    // Two-column pad: every description starts at the same column.
+    let name_w = rows
+        .iter()
+        .skip(start)
+        .take(show_rows)
+        .map(|(name, _, _)| UnicodeWidthStr::width(name.as_str()))
+        .max()
+        .unwrap_or(0);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, (name, desc, hint)) in rows.iter().enumerate().skip(start).take(show_rows) {
+        let selected = i == sel;
+        let mut spans = vec![
+            marker(selected),
+            Span::styled(name.clone(), name_style(selected)),
+        ];
+        if !desc.is_empty() {
+            let pad = name_w.saturating_sub(UnicodeWidthStr::width(name.as_str()));
+            spans.push(Span::raw(" ".repeat(pad + 2)));
+            spans.push(Span::styled(desc.clone(), desc_style));
+            if !hint.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {hint}"),
                     Style::default()
                         .fg(theme.placeholder)
-                        .add_modifier(Modifier::ITALIC)
-                        .bg(match selected {
-                            true => theme.menu_sel_bg,
-                            false => theme.pane_bg,
-                        }),
+                        .add_modifier(Modifier::ITALIC),
                 ));
             }
-            lines.push(mk_row(selected, marker, body));
         }
+        lines.push(Line::from(spans));
     }
     if has_overflow {
         lines.push(Line::from(vec![Span::styled(
             format!("  +{} more", total - show_rows),
-            Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
+            desc_style,
         )]));
     }
-    lines.truncate(inner.height as usize);
-    f.render_widget(Paragraph::new(lines), inner);
+    lines.truncate(area.height as usize);
+    f.render_widget(Paragraph::new(lines), area);
 }
 
-/// @-mention popup (ADR-0012): renders file/dir candidates above the
-/// composer using the same chrome as the slash menu (pane_bg, menu_sel_bg,
-/// ▸ selection marker, accent bold). Shows `+N more` on overflow.
-/// @-mention popup (ADR-0012): fuzzy file/dir candidates in the same
-/// float-box chrome as the slash menu (bordered box, pane_bg fill,
-/// `menu_sel_bg` highlight, accent `▸` marker). Floats above the input
-/// line; `+N more` on overflow.
+/// @-mention rows (ADR-0012): file/dir candidates in the same borderless
+/// docked strip as the slash menu (terminal background, accent-bold `›`
+/// selection marker). Shows `+N more` on overflow. Takes real layout rows
+/// above the composer; never covers input.
 fn render_at_menu(f: &mut ratatui::Frame, app: &App, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -4223,53 +4182,38 @@ fn render_at_menu(f: &mut ratatui::Frame, app: &App, area: Rect) {
             .saturating_sub(show_rows - 1)
             .min(total.saturating_sub(show_rows)),
     };
-    // Box height = rows + overflow row? + border (2). Same shape as
-    // `render_menu_float`'s box.
-    let mut h = show_rows as u16 + 2;
-    if has_overflow {
-        h += 1;
-    }
-    let inner = crate::popup::render_float(f, area, h, 64, theme);
-    if inner.width < 20 {
-        return;
-    }
+    // Docked strip: rows render directly into the layout slot.
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (i, candidate) in candidates.iter().enumerate().skip(start).take(show_rows) {
         let selected = i == sel;
-        let row_style = match selected {
-            true => Style::default().bg(theme.menu_sel_bg),
-            false => Style::default().bg(theme.pane_bg),
-        };
         let marker = match selected {
             true => Span::styled(
-                "▸ ",
+                "› ",
                 Style::default()
                     .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD)
-                    .bg(theme.menu_sel_bg),
+                    .add_modifier(Modifier::BOLD),
             ),
-            false => Span::styled("  ", Style::default().bg(theme.pane_bg)),
+            false => Span::raw("  "),
         };
         let name_style = match selected {
             true => Style::default()
                 .fg(theme.accent)
-                .add_modifier(Modifier::BOLD)
-                .bg(theme.menu_sel_bg),
-            false => Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
+                .add_modifier(Modifier::BOLD),
+            false => Style::default().fg(Color::Gray),
         };
-        let label = candidate.clone();
-        let mut line = Line::from(vec![marker, Span::styled(label, name_style)]);
-        line.style = row_style;
-        lines.push(line);
+        lines.push(Line::from(vec![
+            marker,
+            Span::styled(candidate.clone(), name_style),
+        ]));
     }
     if has_overflow {
         lines.push(Line::from(vec![Span::styled(
             format!("  +{} more", total - show_rows),
-            Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
+            Style::default().fg(Color::DarkGray),
         )]));
     }
-    lines.truncate(inner.height as usize);
-    f.render_widget(Paragraph::new(lines), inner);
+    lines.truncate(area.height as usize);
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// Aster-style footer: one left-aligned line — orange `▶▶▶ edit`, faint
@@ -5638,8 +5582,9 @@ mod tests {
         app.input = "/".to_string();
         app.cursor = 1;
         assert!(is_menu_open(&app));
-        // Float mode: menu draws over pane, no rows consumed.
-        assert_eq!(menu_height(&app), 0);
+        // Docked mode: menu takes real rows above the composer.
+        // 12 registry commands capped at the 10-row budget.
+        assert_eq!(menu_height(&app), 10);
         app.input = "/bogus".to_string();
         app.cursor = 6;
         assert!(!is_menu_open(&app));
@@ -6130,9 +6075,10 @@ mod tests {
 
     #[test]
     fn skill_menu_floats_without_growing_pane() {
-        // Float-world counterpart: the slash menu floats over the pane
-        // (ADR-0011), so `/skill:` suggestions never grow `pane_height`.
-        // The float box itself caps at 7 skill rows + border.
+        // Docked-strip counterpart: the slash menu takes layout rows via
+        // `docked_menu_height`/`viewport_height`, so `/skill:` suggestions
+        // never grow the base `pane_height`. The strip itself caps at 10
+        // rows (`MENU_MAX_ROWS`) with `+N more` on overflow.
         let mut app = App::new("model".to_string(), "medium".to_string());
         app.skill_names = vec![
             "a".to_string(),
@@ -6147,13 +6093,12 @@ mod tests {
         app.cursor = 7;
         assert!(is_menu_open(&app));
         assert_eq!(menu_row_count_app(&app), 7);
-        // Pane stays compact with the menu open.
+        // Base pane stays compact with the menu open; the viewport grows.
         let with_menu = app.pane_height(80);
         app.menu_sel = None;
         app.input = "hello".to_string();
         let idle = app.pane_height(80);
         assert_eq!(with_menu, idle);
-        // The live float menu sees all 7 skill rows.
         app.input = "/skill:".to_string();
         app.cursor = 7;
         let live = menu_live(&app.input, app.cursor, &app.skill_names, &app.model_names);
@@ -6488,15 +6433,17 @@ mod tests {
     #[test]
     fn slash_menu_renders_rows_above_composer() {
         use ratatui::{Terminal, backend::TestBackend};
-        let backend = TestBackend::new(80, PANE_ROWS);
-        let mut terminal = Terminal::new(backend).unwrap();
+        // Docked strip grows the viewport: size the backend for pane + menu.
         let mut app = App::new("test-model".to_string(), "medium".to_string());
         app.input = "/".to_string();
         app.cursor = 1;
         app.menu_sel = Some(0);
+        let h = viewport_height(&app, 80, 24);
+        let backend = TestBackend::new(80, h);
+        let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render_pane(f, &mut app)).unwrap();
         let text = terminal.backend().to_string();
-        // Float box renders over the pane. All commands visible.
+        // Borderless docked strip above the composer. All commands visible.
         for name in ["/quit", "/new"] {
             assert!(text.contains(name), "menu row missing {name}: {text}");
         }
@@ -6504,8 +6451,8 @@ mod tests {
             text.contains("start a new session"),
             "menu desc missing: {text}"
         );
-        assert!(text.contains('▸'), "selection marker missing: {text}");
-        assert!(text.contains("┌"), "box border missing: {text}");
+        assert!(text.contains('›'), "selection marker missing: {text}");
+        assert!(!text.contains("┌"), "menu must be borderless: {text}");
         let menu_row = text.lines().position(|l| l.contains("/quit")).unwrap();
         let input_row = text.lines().position(|l| l.contains("❯ /")).unwrap();
         assert!(menu_row < input_row, "menu must render above the composer");
@@ -6520,51 +6467,94 @@ mod tests {
     }
 
     #[test]
+    fn slash_menu_docked_rows_align_two_columns_without_chrome() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App::new("test-model".to_string(), "medium".to_string());
+        app.input = "/".to_string();
+        app.cursor = 1;
+        app.menu_sel = Some(0);
+        let h = viewport_height(&app, 80, 24);
+        let backend = TestBackend::new(80, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_pane(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| cell_text(&buf, y, buf.area.width))
+            .collect();
+        // Reference chrome: borderless two-column rows — descriptions of
+        // `/new` and `/quit` start at the same column, rows carry no fill
+        // or border glyphs, only the selected name carries the accent.
+        let desc_col = |cmd: &str, desc: &str| -> Option<usize> {
+            let line = rows.iter().find(|l| l.contains(cmd))?;
+            let ci = line.find(cmd)? + cmd.len();
+            let d = line[ci..].find(desc)? + ci;
+            Some(UnicodeWidthStr::width(&line[..d]))
+        };
+        let new_col = desc_col("/new", "start a new session").expect("missing /new desc");
+        let quit_col = desc_col("/quit", "quit the app").expect("missing /quit desc");
+        assert_eq!(new_col, quit_col, "desc column must align");
+        assert!(
+            rows.iter().any(|l| l.contains('›')),
+            "selection marker missing"
+        );
+        assert!(
+            !rows.iter().any(|l| l.contains('┌') || l.contains('│')),
+            "menu must be borderless"
+        );
+        assert!(
+            (0..buf.area.height).all(|y| buf[(0, y)].bg != app.theme.pane_bg),
+            "docked strip must not fill the background"
+        );
+        let my = rows.iter().position(|l| l.contains('›')).unwrap() as u16;
+        let mx = rows[my as usize].find('›').unwrap() as u16;
+        assert_eq!(buf[(mx, my)].fg, app.theme.accent);
+    }
+
+    #[test]
     fn skill_menu_renders_skill_rows_above_composer() {
         use ratatui::{Terminal, backend::TestBackend};
-        let backend = TestBackend::new(80, PANE_ROWS);
-        let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new("test-model".to_string(), "medium".to_string());
         app.skill_names = vec!["pdf".to_string(), "plan".to_string()];
         app.input = "/skill:p".to_string();
         app.cursor = 8;
         app.menu_sel = Some(0);
+        let h = viewport_height(&app, 80, 24);
+        let backend = TestBackend::new(80, h);
+        let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render_pane(f, &mut app)).unwrap();
         let text = terminal.backend().to_string();
-        // Float box renders skill rows like theme rows (`▸ <name>`).
+        // Borderless docked strip renders skill rows like theme rows (`› <name>`).
         for name in ["pdf", "plan"] {
             assert!(text.contains(name), "skill row missing {name}: {text}");
         }
-        assert!(text.contains('▸'), "selection marker missing: {text}");
-        assert!(text.contains("┌"), "box border missing: {text}");
-        // Float box covers the composer while open (it owns the keys);
-        // skill rows sit above the pane bottom (no fullscreen takeover).
+        assert!(text.contains('›'), "selection marker missing: {text}");
+        assert!(!text.contains("┌"), "menu must be borderless: {text}");
+        // Docked strip takes layout rows above the composer, so the input
+        // stays visible (no float-box cover); skill rows sit above it.
         let menu_row = text.lines().position(|l| l.contains("pdf")).unwrap();
-        let n_rows = text.lines().count();
-        assert!(
-            menu_row + 1 < n_rows,
-            "menu must render above the pane bottom"
-        );
+        let input_row = text.lines().position(|l| l.contains("❯ /")).unwrap();
+        assert!(menu_row < input_row, "menu must render above the composer");
     }
 
     #[test]
     fn slash_menu_keeps_busy_status_and_composer_visible() {
         use ratatui::{Terminal, backend::TestBackend};
-        let backend = TestBackend::new(80, PANE_ROWS);
-        let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new("test-model".to_string(), "medium".to_string());
         app.busy = true;
         app.input = "/".to_string();
         app.cursor = 1;
         app.menu_sel = Some(2);
+        let h = viewport_height(&app, 80, 24);
+        let backend = TestBackend::new(80, h);
+        let mut terminal = Terminal::new(backend).unwrap();
 
         terminal.draw(|f| render_pane(f, &mut app)).unwrap();
 
         let text = terminal.backend().to_string();
-        // Float box renders over the pane. Status row is behind the box
-        // (text peeks through on edges but may be truncated).
+        // Docked strip takes layout rows above the composer: status stays
+        // on its own row and the input stays visible below the menu.
         assert!(text.contains("/help"), "selected command missing: {text}");
-        assert!(text.contains("┌"), "box border missing: {text}");
+        assert!(!text.contains("┌"), "menu must be borderless: {text}");
         assert!(
             text.lines().any(|line| line.contains("❯ /")),
             "typed input missing: {text}"
@@ -6923,13 +6913,14 @@ mod tests {
         {
             return;
         }
-        let backend = TestBackend::new(80, PANE_ROWS);
-        let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new("model".to_string(), "medium".to_string());
         app.input = "/theme ".to_string();
         app.cursor = app.input.chars().count();
         clamp_menu_sel(&mut app);
         assert!(is_menu_open(&app));
+        let h = viewport_height(&app, 80, 24);
+        let backend = TestBackend::new(80, h);
+        let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render_pane(f, &mut app)).unwrap();
         let text = terminal.backend().to_string();
         let installed = crate::theme::Theme::list_themes().unwrap();
@@ -6938,9 +6929,10 @@ mod tests {
             "theme row missing {}: {text}",
             installed[0]
         );
-        assert!(text.contains('▸'), "selection marker missing: {text}");
-        // Float box may overlap the input row; the box border character
-        // replaces part of the typed text. Check for partial match.
+        assert!(text.contains('›'), "selection marker missing: {text}");
+        assert!(!text.contains("┌"), "menu must be borderless: {text}");
+        // Docked strip keeps the composer on its own rows: full typed
+        // text stays visible below the menu.
         assert!(
             text.lines().any(|l| l.contains("❯ /")),
             "typed input missing: {text}"
@@ -6969,23 +6961,23 @@ mod tests {
         let _ = std::fs::create_dir_all(&test_dir);
         std::fs::write(test_dir.join("alpha.rs"), "fn a() {}").unwrap();
 
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new("model".to_string(), "medium".to_string());
         app.input = "@.rem_at_render_test/".to_string();
         app.cursor = app.input.chars().count();
         clamp_menu_sel(&mut app);
         assert!(at_menu_open(&app), "@-menu should be open");
+        let h = viewport_height(&app, 80, 24).max(20);
+        let backend = TestBackend::new(80, h);
+        let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render_pane(f, &mut app)).unwrap();
         let text = terminal.backend().to_string();
         assert!(text.contains("alpha.rs"), "candidate row missing: {text}");
-        assert!(text.contains('▸'), "selection marker missing: {text}");
-        // Float box sits above the input line by design (same as the
-        // slash float): it overlaps the composer row, so the typed `@`
-        // prefix stays visible left of the centered box. Pin the rows.
+        assert!(text.contains('›'), "selection marker missing: {text}");
+        assert!(!text.contains("┌"), "menu must be borderless: {text}");
+        // Docked strip sits above the input line on its own rows.
         let menu_row = text.lines().position(|l| l.contains("alpha.rs")).unwrap();
         let input_row = text.lines().position(|l| l.contains("❯ @")).unwrap();
-        assert!(menu_row <= input_row, "menu must render above the composer");
+        assert!(menu_row < input_row, "menu must render above the composer");
         let _ = std::fs::remove_dir_all(&test_dir);
     }
 
