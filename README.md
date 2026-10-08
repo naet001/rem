@@ -174,9 +174,25 @@ Missing keys and bad hex fall back per-key to the built-in palette. See `docs/th
 
 ## Tools
 
-11 tools, wired through Rig's multi-step loop (up to 100 model/tool steps per turn):
+13 tools, wired through Rig's multi-step loop (up to 100 model/tool steps per turn):
 
-`read`, `write`, `edit`, `bash`, `list_directory`, `git_status`, `git_diff`, `grep`, `glob`, `web_fetch` (URL → text), `web_search` (DuckDuckGo, no key).
+`read`, `write`, `edit`, `bash`, `list_directory`, `git_status`, `git_diff`, `grep`, `glob`, `web_fetch` (URL → text), `web_search` (DuckDuckGo, no key), `todowrite`, `task`.
+
+### Subagents (serial, v1)
+
+`todowrite` owns the session task list. Pass the full list every call; each item is `content` + `status` (`pending` / `in_progress` / `completed`). Unknown fields (e.g. Claude-style `priority`) are accepted and ignored. `/todos` shows the list; `/new` clears it.
+
+```
+{"todos": [{"content": "write failing test", "status": "completed"}, {"content": "make it pass", "status": "in_progress"}]}
+```
+
+`task` spawns one scoped subagent and waits for its final summary:
+
+```
+{"description": "fix login retry", "prompt": "Fix the login retry bug in src/auth.rs. Read the file first, keep the change minimal, summarize what changed."}
+```
+
+Caps and abort semantics: serial only (one child at a time); the child gets a fresh context plus your prompt under the identical preamble, the same tools minus `task` (depth-1, no recursion), the same 100-turn / 30s-bash budget. Child `Confirm` verdicts park on the same approval queue you already answer; annihilator `Deny` still blocks without asking. The parent transcript shows a single `task` row (summary only, capped at 4000 chars) — inner steps are never streamed. `Esc` aborts the child with the turn; headless keeps deny-by-default with `--allow-all` auto-approving child `Confirm`s. Parallel fan-out and background `/tasks` are deferred.
 
 Project context: project-root `AGENTS.md` only (no walk-up, no global), appended verbatim after the preamble under `Project context from AGENTS.md:`. Missing file = silently skipped. Survives compaction, takes effect on next restart. History compacts past 100 messages via one-shot summary (tools off, no recursion) — failures restore history instead of dropping it.
 

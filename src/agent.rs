@@ -19,8 +19,9 @@ use crate::{
     modes::Mode,
     permissions::{ApprovalTx, PermissionHook},
     tools::{
-        BashTool, EditTool, GitDiffTool, GitStatusTool, GlobTool, GrepTool, ListDirectoryTool,
-        ReadTool, WebFetchTool, WebSearchTool, WriteTool,
+        BackgroundInfo, BackgroundStore, BashTool, EditTool, GitDiffTool, GitStatusTool, GlobTool,
+        GrepTool, ListDirectoryTool, ReadTool, TaskChildRunner, TaskTool, TodoItem, TodoWriteTool,
+        WebFetchTool, WebSearchTool, WriteTool,
     },
 };
 
@@ -114,6 +115,50 @@ pub trait AgentLoop {
     fn mcp_logout(&self, _name: &str) -> Result<String, String> {
         Err("not supported".to_string())
     }
+    /// `/undo`: restore the pre-turn state from the newest checkpoint —
+    /// files (reverse-apply the snapshot diff) and history (roll back
+    /// `messages_json` + turn counter). Returns a human summary.
+    /// Default: unsupported. Caller (TUI) must refuse while busy.
+    fn undo_sync(&self) -> Result<String, String> {
+        Err("not supported".to_string())
+    }
+    /// `/rewind n`: same restore as `undo_sync` but for the checkpoint
+    /// `n` turns back (clamped to the oldest); does not consume checkpoints.
+    /// Default: unsupported. Caller (TUI) must refuse while busy.
+    fn rewind_sync(&self, _n: usize) -> Result<String, String> {
+        Err("not supported".to_string())
+    }
+    /// Current todo list snapshot. Defaulted so other `AgentLoop` impls
+    /// report none.
+    fn list_todos(&self) -> Vec<crate::tools::TodoItem> {
+        Vec::new()
+    }
+    /// Clear the todo list (`/new` resets alongside context).
+    /// Default: no-op success.
+    fn clear_todos(&self) -> Result<(), String> {
+        Ok(())
+    }
+    /// Background-task snapshots for `/tasks`. Defaulted so other
+    /// `AgentLoop` impls report none.
+    fn list_background(&self) -> Vec<crate::tools::BackgroundInfo> {
+        Vec::new()
+    }
+    /// One background task by id for `/tasks <id>`. Default: none.
+    fn background_detail(&self, _id: &str) -> Option<crate::tools::BackgroundInfo> {
+        None
+    }
+    /// Drain finished background tasks the model hasn't seen; the TUI
+    /// prepends them to the next submit prompt. Default: none.
+    fn take_background_completed(&self) -> Vec<crate::tools::BackgroundInfo> {
+        Vec::new()
+    }
+    /// Clear background tasks (`/new` resets alongside context + todos).
+    /// Default: no-op success.
+    fn clear_background(&self) -> Result<(), String> {
+        Ok(())
+    }
+    /// `false` in headless `-p`: `background:true` then runs inline.
+    fn set_background_enabled(&self, _on: bool) {}
     // Trait surface for alternate `AgentLoop` impls; `RigAgent` overrides it.
     #[allow(dead_code)]
     async fn export_messages_json(&self) -> Result<String, String> {
@@ -184,8 +229,33 @@ impl ToolEvent {
     }
 }
 
+/// Short todo-list preview for the `todowrite` tree leaf, e.g. `2/5 done`.
+/// Falls back to the compact-args shape when no items parse.
+pub fn todowrite_preview(args: &serde_json::Value) -> String {
+    let items = args.get("todos").and_then(|v| v.as_array());
+    let items = match items {
+        Some(items) => items,
+        None => return compact_args(args),
+    };
+    let total = items.len();
+    let done = items
+        .iter()
+        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed"))
+        .count();
+    match total {
+        0 => "list cleared".to_string(),
+        _ => format!("{done}/{total} done"),
+    }
+}
+
 fn preview_args(name: &str, args: &serde_json::Value) -> String {
     let get = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    if name == "todowrite" {
+        return todowrite_preview(args);
+    }
+    if name == "task" {
+        return crate::tools::task_preview(args);
+    }
     match name {
         "read" | "write" | "edit" | "list_directory" => {
             get("path").unwrap_or_else(|| compact_args(args))
@@ -304,7 +374,7 @@ fn first_line(s: &str, max: usize) -> String {
 }
 
 /// Rig-backed agent: OpenAI-compatible `/chat/completions` model + preamble +
-/// the 11 file/shell/git/search/web tools, using Rig's built-in multi-step loop (no hand-rolled ReAct).
+/// the 13 file/shell/git/search/web/todo/task tools, using Rig's built-in multi-step loop (no hand-rolled ReAct).
 /// Conversation history is caller-owned in [`Context`]: tool outputs are
 /// truncated on entry and old turns are summarized past 100 messages.
 pub struct RigAgent {
@@ -316,13 +386,20 @@ pub struct RigAgent {
     /// so the sync TUI path can switch through `&self`.
     switch_state: Arc<Mutex<SwitchState>>,
     mode: Arc<Mutex<Mode>>,
+    /// Session todo list, shared with the `todowrite` tool instance.
+    /// Same `Arc<Mutex>` shape as `mode`; cleared on `/new`.
+    todos: Arc<Mutex<Vec<TodoItem>>>,
+    /// Session background-task store, shared with the `task` tool for
+    /// `background:true` detach + with the TUI for `/tasks` + submit-time
+    /// injection. Session-memory only (never persisted); cleared on `/new`.
+    background: Arc<BackgroundStore>,
     // Rebuild inputs for `/skills reload`: the inner `Agent` is frozen at
     // build time, so reload re-runs `build_inner` with a fresh skill scan.
     cfg: Config,
     project_root: std::path::PathBuf,
     gate: PermissionHook,
     skills: Arc<Mutex<Vec<crate::skills::Skill>>>,
-    // Shared tool registry: 11 built-ins + runtime-added MCP tools.
+    // Shared tool registry: 13 static tools + runtime-added MCP tools.
     // Held here (not rebuilt) so `/skills reload` and preamble rebuilds
     // never drop MCP registrations.
     tool_handle: rig::agent::tool::server::ToolServerHandle,
@@ -336,10 +413,18 @@ pub struct RigAgent {
     mcp_state: crate::mcp::SharedMcpState,
 }
 
-/// Build the shared tool registry: all 11 static built-ins on one
+/// Build the shared tool registry: all 13 static built-ins on one
 /// `ToolServerHandle` so later MCP tools can join the same registry.
-fn build_tool_server() -> rig::agent::tool::server::ToolServerHandle {
+/// `todowrite` shares the session todo list; `task` shares the session
+/// background store through a [`SerialTaskRunner`] wired to the live
+/// provider/model/effort pointer, so `/model`, `/effort`, and
+/// `/skills reload` rebuilds reuse this same handle untouched.
+fn build_tool_server(
+    todos: &Arc<Mutex<Vec<TodoItem>>>,
+    task_runner: SerialTaskRunner,
+) -> rig::agent::tool::server::ToolServerHandle {
     use rig::agent::tool::server::ToolServer;
+    let background = task_runner.background.clone();
     ToolServer::new()
         .tool(ReadTool)
         .tool(WriteTool)
@@ -352,6 +437,11 @@ fn build_tool_server() -> rig::agent::tool::server::ToolServerHandle {
         .tool(GlobTool)
         .tool(WebFetchTool)
         .tool(WebSearchTool)
+        .tool(TodoWriteTool::with_shared(todos.clone()))
+        .tool(TaskTool::with_background(
+            Arc::new(task_runner),
+            background,
+        ))
         .run()
 }
 
@@ -370,6 +460,136 @@ impl SwitchState {
     fn tag(&self) -> String {
         format!("{}:{}", self.provider, self.model)
     }
+}
+
+/// Delegation note appended to the child preamble for serial `task`
+/// subagents (ticket 02): names the assignment and demands a final
+/// summary, since only the summary returns to the parent turn.
+fn child_delegation_note(description: &str) -> String {
+    format!(
+        "\n\nYou are a subagent doing one scoped assignment: {description}. \
+         Do the work with your tools, then reply with a concise final summary of what you did and what changed. \
+         Your reply is the only thing the parent session sees — inner tool steps are not streamed."
+    )
+}
+
+/// Production [`TaskChildRunner`]: builds one depth-1 child agent per call
+/// from the parent leg's staged config + live effort, with a fresh
+/// caller-owned [`Context`], fresh recorder, and fresh todo list. The child
+/// gate shares the parent approval channel (same FIFO queue, labeled with
+/// the child description so parallel Confirms attribute) and the
+/// annihilator Deny floor holds, but the child never receives the `task`
+/// tool itself — depth-1 is denied-at-schema, not merely policy.
+/// Inline calls are awaited, never `tokio::spawn`, so aborting the parent
+/// turn cancels the in-flight child future. Only `background:true` detaches
+/// (scoped to the session [`BackgroundStore`]); fan-out itself runs on a
+/// scoped `JoinSet` inside the tool call.
+#[derive(Debug, Clone)]
+struct SerialTaskRunner {
+    /// Canonical config (provider entries). The live provider/model/effort
+    /// pointer is read per child call, so `/model` + `/effort` switches
+    /// and `/skills reload` never need a runner rebuild — the single
+    /// runner constructed with the agent stays correct forever.
+    cfg: Config,
+    live: Arc<Mutex<SwitchState>>,
+    gate: PermissionHook,
+    project_root: std::path::PathBuf,
+    /// Shared skills snapshot (same Arc the reload path swaps). Child
+    /// preamble always reads the current list.
+    skills: Arc<Mutex<Vec<crate::skills::Skill>>>,
+    background: Arc<BackgroundStore>,
+}
+
+#[async_trait]
+impl TaskChildRunner for SerialTaskRunner {
+    async fn run_child(&self, description: &str, prompt: &str) -> Result<String, String> {
+        // Fresh child + fresh Context per attempt: a retryable provider
+        // failure rebuilds rather than reusing a half-driven turn.
+        // The child gate is labeled so fan-out Confirms name their child
+        // in the shared FIFO modal; same channel, same Deny floor.
+        let gate = self.gate.with_task_label(description);
+        with_retry({
+            let this = self.clone();
+            let gate = gate.clone();
+            let description = description.to_owned();
+            let prompt = prompt.to_owned();
+            move |_| {
+                let this = this.clone();
+                let gate = gate.clone();
+                let description = description.clone();
+                let prompt = prompt.clone();
+                async move {
+                    let child = this.build_child_agent(&description, &gate)?;
+                    let mut ctx = Context::new();
+                    Chat::chat(&child, prompt, ctx.messages_mut())
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            }
+        })
+        .await
+        .map_err(|e| {
+            let tag = self
+                .live
+                .lock()
+                .map(|s| s.tag())
+                .unwrap_or_else(|_| "model".to_string());
+            format!("{tag}: {e}")
+        })
+    }
+}
+
+impl SerialTaskRunner {
+    /// Fresh child agent for one assignment: canonical config staged at
+    /// the live pointer + live effort + current skills, same preamble +
+    /// delegation note, scoped toolset without `task`. Exposed for the
+    /// depth-1 schema test via `tool_definitions`.
+    /// `gate` is the labeled child gate (same channel as the parent leg).
+    fn build_child_agent(
+        &self,
+        description: &str,
+        gate: &PermissionHook,
+    ) -> Result<rig::agent::Agent, String> {
+        let (provider, model, effort) = self
+            .live
+            .lock()
+            .map(|s| (s.provider.clone(), s.model.clone(), s.effort.clone()))
+            .map_err(|_| "agent busy, try again".to_string())?;
+        let staged = staged_config(&self.cfg, &provider, &model, &effort)?;
+        let skills = self
+            .skills
+            .lock()
+            .map(|g| g.clone())
+            .map_err(|_| "agent busy, try again".to_string())?;
+        let recorder = ToolRecorder::default();
+        let todos: Arc<Mutex<Vec<TodoItem>>> = Arc::new(Mutex::new(Vec::new()));
+        RigAgent::build_child_inner(
+            &staged,
+            &effort,
+            gate,
+            &recorder,
+            &self.project_root,
+            &skills,
+            &todos,
+            description,
+        )
+    }
+}
+
+/// Shared static preamble: identical for parent and serial child (ticket
+/// 02). The parent appends the `task` delegation line; the child appends
+/// the assignment note. One function so the two can never drift.
+fn base_preamble() -> String {
+    String::from(
+        "You are rem, a coding agent in a terminal TUI. \
+         Use the read/write/edit/bash/list_directory/git_status/git_diff/grep/glob/web_fetch/web_search/todowrite/task tools to inspect and change files. \
+         list_directory lists a dir, glob finds files by pattern, grep searches contents, git_status/git_diff inspect git state. \
+         web_search searches the web (DuckDuckGo, no key), web_fetch reads a URL as text. \
+         todowrite owns the session task list: pass the full list each call with content + status (pending/in_progress/completed). \
+         task spawns scoped subagent(s): single description (short label) + prompt (full task), or tasks[] array (up to 8 independent subtasks, 4 at a time, merged as ## sections in input order); background:true detaches the call and delivers the summary on a later turn. Children run under the same tools minus task (no recursion). \
+         Bash runs `sh -c` in the project dir (30s timeout). Destructive shell patterns are blocked outright; other mutations and network access ask the human for approval mid-run — if a call is denied, replan without it. \
+         Prefer reading a file before editing it. Keep replies concise.",
+    )
 }
 
 /// Project instructions file name, loaded from the project root only.
@@ -471,30 +691,22 @@ fn staged_config(
         .ok_or_else(|| format!("unknown provider \"{provider}\""))?;
     Ok(staged)
 }
-
 /// Load project-root `AGENTS.md` verbatim. No cap, no transform.
 /// Returns `None` when missing/unreadable (caller silently skips).
 fn load_agents_md(project_root: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(project_root.join(AGENTS_MD)).ok()
 }
-
-/// Compose the agent preamble: static instructions + project context +
-/// skills index + MCP index. Pure constructor — called at startup and on
-/// `/skills reload`. `mcp_section` is pre-rendered by the MCP module
-/// (empty when no servers); Ticket 05 refreshes it on `/mcp` toggles.
+/// Compose the agent preamble: shared static instructions + project
+/// context + skills index + MCP index. Pure constructor — called at
+/// startup and on `/skills reload`. `mcp_section` is pre-rendered by
+/// the MCP module (empty when no servers); Ticket 05 refreshes it on
+/// `/mcp` toggles.
 fn build_preamble(
     project_root: &std::path::Path,
     skills: &[crate::skills::Skill],
     mcp_section: &str,
 ) -> String {
-    let mut preamble = String::from(
-        "You are rem, a coding agent in a terminal TUI. \
-         Use the read/write/edit/bash/list_directory/git_status/git_diff/grep/glob/web_fetch/web_search tools to inspect and change files. \
-         list_directory lists a dir, glob finds files by pattern, grep searches contents, git_status/git_diff inspect git state. \
-         web_search searches the web (DuckDuckGo, no key), web_fetch reads a URL as text. \
-         Bash runs `sh -c` in the project dir (30s timeout). Destructive shell patterns are blocked outright; other mutations and network access ask the human for approval mid-run — if a call is denied, replan without it. \
-         Prefer reading a file before editing it. Keep replies concise.",
-    );
+    let mut preamble = base_preamble();
     if let Some(body) = load_agents_md(project_root) {
         preamble.push_str(AGENTS_MD_HEADER);
         preamble.push_str(&body);
@@ -528,17 +740,37 @@ impl RigAgent {
     ) -> Result<Self, String> {
         let recorder = ToolRecorder::default();
         let mode = Arc::new(Mutex::new(Mode::default()));
+        let todos: Arc<Mutex<Vec<TodoItem>>> = Arc::new(Mutex::new(Vec::new()));
         // Observer first (see everything), gate second (steers). ADR-0001.
         let gate = PermissionHook::new(approval_tx, project_root.clone(), mode.clone());
         let skills = crate::skills::discover(&project_root);
-        let tool_handle = build_tool_server();
+        let skills_shared = Arc::new(Mutex::new(skills.clone()));
+        let background: Arc<BackgroundStore> = Arc::new(BackgroundStore::new());
         let mcp_state: crate::mcp::SharedMcpState = Default::default();
 
         let resolved = cfg.active()?;
         let effort = normalize_effort(&cfg.effort).to_string();
-        // Resolve + validate the startup target before building so a bad
-        // key/endpoint fails here, not inside the builder.
         let staged = staged_config(cfg, &resolved.name, &resolved.model, &effort)?;
+        let switch_state = Arc::new(Mutex::new(SwitchState {
+            provider: resolved.name,
+            model: resolved.model,
+            effort: effort.clone(),
+        }));
+        // `task` runner for the parent leg: wired to the live
+        // provider/model/effort pointer + shared gate + project root +
+        // shared skills + store, so `/model`, `/effort`, and
+        // `/skills reload` rebuilds never touch it. Registered once on
+        // the shared handle below; the child built per call never
+        // receives this runner (depth-1).
+        let task_runner = SerialTaskRunner {
+            cfg: cfg.clone(),
+            live: switch_state.clone(),
+            gate: gate.clone(),
+            project_root: project_root.clone(),
+            skills: skills_shared.clone(),
+            background: background.clone(),
+        };
+        let tool_handle = build_tool_server(&todos, task_runner);
         let agent = Self::build_inner(
             &staged,
             &effort,
@@ -554,16 +786,14 @@ impl RigAgent {
             inner: tokio::sync::RwLock::new(agent),
             context: tokio::sync::Mutex::new(Context::new()),
             recorder,
-            switch_state: Arc::new(Mutex::new(SwitchState {
-                provider: resolved.name,
-                model: resolved.model,
-                effort,
-            })),
+            switch_state,
             mode,
+            todos,
+            background,
             cfg: cfg.clone(),
             project_root,
             gate,
-            skills: Arc::new(Mutex::new(skills)),
+            skills: skills_shared,
             tool_handle,
             mcp_section: std::sync::Mutex::new(mcp_section.to_string()),
             mcp_state,
@@ -582,7 +812,7 @@ impl RigAgent {
     }
 
     /// Build the inner `rig::agent::Agent`: client + preamble (static +
-    /// AGENTS.md + skills index) + 11 tools + hooks. Pure constructor —
+    /// AGENTS.md + skills index) + shared tool handle (13 statics + MCP) + hooks. Pure constructor —
     /// called at startup, on `/skills reload`, and on `/model` switches.
     /// Branches on the active provider entry: OpenAI-compatible legs keep
     /// chat-completions semantics, Anthropic legs use the native Messages
@@ -660,6 +890,122 @@ impl RigAgent {
             .build();
 
         Ok(agent)
+    }
+
+    /// Depth-1 child constructor: identical client/preamble/params path as
+    /// [`RigAgent::build_inner`] plus the delegation note, scoped toolset
+    /// (same 11 file/shell/git/search/web tools + `todowrite`, never `task` —
+    /// so 12 in the child vs 13 in the parent),
+    /// same 100-turn budget, fresh recorder + gate + todos from the caller.
+    /// The parent leg passes its own `task` runner separately — the child
+    /// never receives one.
+    #[allow(clippy::too_many_arguments)]
+    fn build_child_inner(
+        effective: &Config,
+        effort: &str,
+        gate: &PermissionHook,
+        recorder: &ToolRecorder,
+        project_root: &std::path::Path,
+        skills: &[crate::skills::Skill],
+        todos: &Arc<Mutex<Vec<TodoItem>>>,
+        description: &str,
+    ) -> Result<rig::agent::Agent, String> {
+        let resolved = effective.active()?;
+        let effort = normalize_effort(effort);
+        let handle: rig::agent::ModelHandle = match resolved.kind {
+            ProviderKind::OpenAICompatible => {
+                let base_url = resolved.base_url.clone().ok_or_else(|| {
+                    format!(
+                        "provider \"{}\" type openai-compatible requires base_url",
+                        resolved.name
+                    )
+                })?;
+                let client = openai::CompletionsClient::builder()
+                    .api_key(resolved.key.clone())
+                    .base_url(base_url)
+                    .build()
+                    .map_err(|e| format!("failed to build LLM client: {e}"))?;
+                rig::agent::ModelHandle::new(client.completion_model(resolved.model.clone()))
+            }
+            ProviderKind::Anthropic => {
+                let base_url = resolved
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+                let client = anthropic::Client::builder()
+                    .api_key(resolved.key.clone())
+                    .base_url(base_url)
+                    .build()
+                    .map_err(|e| format!("failed to build LLM client: {e}"))?;
+                rig::agent::ModelHandle::new(client.completion_model(resolved.model.clone()))
+            }
+        };
+        let additional_params = match resolved.kind {
+            ProviderKind::OpenAICompatible => {
+                serde_json::json!({"reasoning_effort": effort})
+            }
+            ProviderKind::Anthropic => {
+                let (budget, max_tokens) = anthropic_budget(effort);
+                serde_json::json!({
+                    "thinking": {"type": "enabled", "budget_tokens": budget},
+                    "max_tokens": max_tokens,
+                })
+            }
+        };
+        let mut preamble = base_preamble();
+        if let Some(body) = load_agents_md(project_root) {
+            preamble.push_str(AGENTS_MD_HEADER);
+            preamble.push_str(&body);
+        }
+        if !skills.is_empty() {
+            preamble.push_str(&crate::skills::preamble_section(skills));
+        }
+        preamble.push_str(&child_delegation_note(description));
+        let agent = AgentBuilder::from_model_handle(handle)
+            .preamble(&preamble)
+            .tool(ReadTool)
+            .tool(WriteTool)
+            .tool(EditTool)
+            .tool(BashTool)
+            .tool(ListDirectoryTool)
+            .tool(GitStatusTool)
+            .tool(GitDiffTool)
+            .tool(GrepTool)
+            .tool(GlobTool)
+            .tool(WebFetchTool)
+            .tool(WebSearchTool)
+            .tool(TodoWriteTool::with_shared(todos.clone()))
+            .default_max_turns(100)
+            .additional_params(additional_params)
+            .add_hook(recorder.clone())
+            .add_hook(gate.clone())
+            .build();
+        Ok(agent)
+    }
+
+    /// Test seam: the serial `task` runner for the live leg. The runner
+    /// reads the live pointer per child call, so the seam rebuilds an
+    /// equivalent runner from canonical config + shared state.
+    #[cfg(test)]
+    fn test_task_runner(&self) -> SerialTaskRunner {
+        SerialTaskRunner {
+            cfg: self.cfg.clone(),
+            live: self.switch_state.clone(),
+            gate: self.gate.clone(),
+            project_root: self.project_root.clone(),
+            skills: self.skills.clone(),
+            background: self.background.clone(),
+        }
+    }
+
+    /// Test seam: build the serial child for `description` from the live
+    /// leg (staged config snapshot + live effort + shared gate). The
+    /// depth-1 schema test asserts on `tool_definitions` — never `task`.
+    #[cfg(test)]
+    fn build_serial_child(&self, description: &str) -> Result<rig::agent::Agent, String> {
+        let runner = self.test_task_runner();
+        let gate = self.gate.with_task_label(description);
+        runner.build_child_agent(description, &gate)
     }
 
     /// Provider-qualified tag for the footer and Session record
@@ -779,10 +1125,14 @@ impl AgentLoop for RigAgent {
             Preserve: filenames touched, decisions made, errors seen, and any pending tasks. \
             Keep it under 1500 chars. Reply with the summary only.";
 
-        // Lock once for the whole turn: history mutation + compaction are atomic
-        // w.r.t. other chat() calls. The TUI serializes turns anyway.
+        // --- SNAPSHOT CAPTURE (pre-turn, before the LLM runs) ---
         let ctx = self.context.lock().await;
         let before = ctx.len();
+        let messages_json = ctx.to_json().unwrap_or_default();
+        let project_root = self.project_root.clone();
+        let git_diff = crate::tools::git::run_git_in(&project_root, vec!["diff".to_string()])
+            .await
+            .unwrap_or_default();
         drop(ctx);
 
         // Fresh per-turn tool + reasoning logs: the hooks append as the turn runs.
@@ -855,6 +1205,11 @@ impl AgentLoop for RigAgent {
             }
         }
 
+        // --- CHECKPOINT DECISION (post-turn, after truncation + compaction) ---
+        let events = self.last_tool_events();
+        let tool_names: Vec<&str> = events.iter().map(|e| e.name.as_str()).collect();
+        ctx.record_turn(&git_diff, &messages_json, tool_names.iter().copied());
+
         Ok(reply)
     }
 
@@ -886,6 +1241,34 @@ impl AgentLoop for RigAgent {
     }
     fn mode_handle(&self) -> Arc<Mutex<Mode>> {
         self.mode.clone()
+    }
+    fn list_todos(&self) -> Vec<TodoItem> {
+        self.todos.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+    fn clear_todos(&self) -> Result<(), String> {
+        match self.todos.lock() {
+            Ok(mut g) => {
+                g.clear();
+                Ok(())
+            }
+            Err(_) => Err("todo list busy, try again".to_string()),
+        }
+    }
+    fn list_background(&self) -> Vec<BackgroundInfo> {
+        self.background.list()
+    }
+    fn background_detail(&self, id: &str) -> Option<BackgroundInfo> {
+        self.background.detail(id.trim())
+    }
+    fn take_background_completed(&self) -> Vec<BackgroundInfo> {
+        self.background.take_completed()
+    }
+    fn clear_background(&self) -> Result<(), String> {
+        self.background.clear();
+        Ok(())
+    }
+    fn set_background_enabled(&self, on: bool) {
+        self.background.set_enabled(on);
     }
     async fn export_messages_json(&self) -> Result<String, String> {
         self.context.lock().await.to_json()
@@ -994,8 +1377,8 @@ impl AgentLoop for RigAgent {
     }
     /// Re-scan skill dirs + rebuild the inner `Agent` so subsequent turns see
     /// new/edited skills. History (`Context`), recorder, gate allows, mode,
-    /// and switch state survive (same Arcs reused). Fail-closed: rebuild
-    /// error keeps old agent.
+    /// switch state, and the shared todo list survive (same Arcs reused).
+    /// Fail-closed: rebuild error keeps old agent.
     /// Caller (TUI) must refuse while a turn is in-flight (`app.busy`).
     /// Reload preserves the MCP preamble index: reload is skills-only.
     /// Ticket 05 recomputes the section on `/mcp` toggles.
@@ -1193,6 +1576,56 @@ impl AgentLoop for RigAgent {
             Err(_) => crate::context::ContextStats::default(),
         }
     }
+
+    /// `/undo`: peek the newest checkpoint, restore FILES first (so a git
+    /// failure leaves history + checkpoint untouched and retryable), then
+    /// consume the checkpoint and roll history + turn counter back.
+    fn undo_sync(&self) -> Result<String, String> {
+        let cp = {
+            let ctx = self
+                .context
+                .try_lock()
+                .map_err(|_| "context busy, try again".to_string())?;
+            ctx.checkpoints()
+                .back()
+                .cloned()
+                .ok_or_else(|| "no checkpoints to undo".to_string())?
+        };
+        let files = crate::tools::git::restore_diff(&self.project_root, &cp.git_diff)?;
+        let mut ctx = self
+            .context
+            .try_lock()
+            .map_err(|_| "context busy, try again".to_string())?;
+        ctx.undo_last()?;
+        Ok(format!(
+            "undid turn {}: history restored, {files}",
+            cp.turn_idx
+        ))
+    }
+
+    /// `/rewind n`: same two-phase restore as `undo_sync`, but the target
+    /// comes from `Context::peek_rewind` (clamped, non-consuming).
+    fn rewind_sync(&self, n: usize) -> Result<String, String> {
+        // Peek the exact target checkpoint (clamping happens inside),
+        // then restore files from it, then history.
+        let target = {
+            let ctx = self
+                .context
+                .try_lock()
+                .map_err(|_| "context busy, try again".to_string())?;
+            ctx.peek_rewind(n)?
+        };
+        let files = crate::tools::git::restore_diff(&self.project_root, &target.git_diff)?;
+        let mut ctx = self
+            .context
+            .try_lock()
+            .map_err(|_| "context busy, try again".to_string())?;
+        ctx.rewind_n(n)?;
+        Ok(format!(
+            "rewound to turn {}: history restored, {files}",
+            target.turn_idx
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1200,8 +1633,12 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn tool_server_registers_all_eleven_builtins() {
-        let handle = build_tool_server();
+    async fn tool_server_registers_all_thirteen_statics() {
+        // Build through the live agent so the runner wiring (live pointer
+        // + shared skills + background store) matches production.
+        let agent = test_agent();
+        let runner = agent.test_task_runner();
+        let handle = build_tool_server(&agent.todos, runner);
         let mut names: Vec<String> = handle
             .get_tool_defs(None)
             .await
@@ -1221,6 +1658,8 @@ mod tests {
                 "grep",
                 "list_directory",
                 "read",
+                "task",
+                "todowrite",
                 "web_fetch",
                 "web_search",
                 "write",
@@ -1485,6 +1924,144 @@ default_model = "claude-sonnet-4-5"
         RigAgent::new(&test_config(), tx, dir).unwrap()
     }
 
+    /// Make `dir` a git repo with one committed file (the undo fixture).
+    fn git_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "base\n").unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["add", "."]);
+        run(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ]);
+        file
+    }
+
+    /// Like `test_agent()` but with a per-test dir so parallel undo tests
+    /// never wipe each other's git fixtures.
+    fn undo_test_agent(name: &str) -> RigAgent {
+        unsafe {
+            std::env::set_var("REM_TEST_SWITCH_OPENAI", "sk-openai-test");
+            std::env::set_var("REM_TEST_SWITCH_ANTHROPIC", "sk-anthropic-test");
+        }
+        let dir = std::env::temp_dir().join(format!("rem-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, _rx) = crate::permissions::approval_channel();
+        RigAgent::new(&test_config(), tx, dir).unwrap()
+    }
+
+    #[tokio::test]
+    async fn undo_restores_history_and_files() {
+        let agent = undo_test_agent("undo-restores");
+        let file = git_fixture(&agent.project_root);
+
+        // Simulate one mutate turn: pre-state recorded, then the turn edits.
+        {
+            let mut ctx = agent.context.lock().await;
+            ctx.messages_mut()
+                .push(rig::message::Message::user("before edit"));
+            let pre = ctx.to_json().unwrap();
+            ctx.record_turn("(clean)", &pre, ["edit"]);
+        }
+        std::fs::write(&file, "turn edit\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "turn edit\n");
+
+        let summary = agent.undo_sync().expect("undo works");
+        assert!(summary.contains("history restored"), "got: {summary}");
+        // File rolled back to the committed pre-turn state.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "base\n");
+        // History + turn counter rolled back.
+        let ctx = agent.context.lock().await;
+        assert_eq!(ctx.len(), 1);
+        assert_eq!(ctx.turn_idx(), 0);
+        assert_eq!(ctx.checkpoints().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn undo_errors_without_checkpoints_and_touches_nothing() {
+        let agent = undo_test_agent("undo-noop");
+        let file = git_fixture(&agent.project_root);
+        std::fs::write(&file, "my work\n").unwrap();
+
+        let err = agent.undo_sync().unwrap_err();
+        assert!(err.contains("no checkpoints"), "got: {err}");
+        // Untouched: no checkpoints means no file or history churn.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "my work\n");
+    }
+
+    #[tokio::test]
+    async fn rewind_restores_that_turn_and_clamps_with_files() {
+        let agent = undo_test_agent("rewind-restores");
+        let file = git_fixture(&agent.project_root);
+
+        // Turn 0: pre-state clean (just committed), then a mutate lands edit1.
+        {
+            let mut ctx = agent.context.lock().await;
+            ctx.messages_mut().push(rig::message::Message::user("t0"));
+            let pre = ctx.to_json().unwrap();
+            let d0 = crate::tools::git::run_git_in(&agent.project_root, vec!["diff".into()])
+                .await
+                .unwrap();
+            ctx.record_turn(&d0, &pre, ["bash"]);
+        }
+        std::fs::write(&file, "edit1\n").unwrap();
+
+        // Turn 1: pre-state = edit1 (real diff captured), mutate lands edit2.
+        {
+            let mut ctx = agent.context.lock().await;
+            ctx.messages_mut().push(rig::message::Message::user("t1"));
+            let pre = ctx.to_json().unwrap();
+            let d1 = crate::tools::git::run_git_in(&agent.project_root, vec!["diff".into()])
+                .await
+                .unwrap();
+            assert!(d1.contains("edit1"), "pre-turn diff: {d1}");
+            ctx.record_turn(&d1, &pre, ["edit"]);
+        }
+        std::fs::write(&file, "edit2\n").unwrap();
+        let ctx = agent.context.lock().await;
+        assert_eq!(ctx.turn_idx(), 2);
+        assert_eq!(ctx.checkpoints().len(), 2);
+        drop(ctx);
+
+        // rewind 1: back one turn -> files = edit1, history = pre-turn-1.
+        let summary = agent.rewind_sync(1).expect("rewind 1 works");
+        assert!(summary.contains("rewound to turn 1"), "got: {summary}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "edit1\n");
+        let ctx = agent.context.lock().await;
+        assert_eq!(ctx.turn_idx(), 1);
+        assert_eq!(ctx.len(), 2); // t0 + t1
+        drop(ctx);
+
+        // rewind 99: clamps to the oldest -> files = base, turn = 0.
+        let summary = agent.rewind_sync(99).expect("clamped rewind works");
+        assert!(summary.contains("rewound to turn 0"), "got: {summary}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "base\n");
+        let ctx = agent.context.lock().await;
+        assert_eq!(ctx.turn_idx(), 0);
+        assert_eq!(ctx.len(), 1); // only t0
+        // Non-consuming: both checkpoints survive for re-rewind.
+        assert_eq!(ctx.checkpoints().len(), 2);
+    }
+
     #[test]
     fn switch_same_provider_updates_live_model_tag() {
         let agent = test_agent();
@@ -1612,6 +2189,70 @@ default_model = "claude-sonnet-4-5"
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "pdf");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn serial_child_exposes_scoped_tools_without_task() {
+        // Depth-1 at the schema: the child toolset is the same 11
+        // file/shell/git/search/web tools plus `todowrite`, never `task`.
+        let agent = test_agent();
+        let child = agent.build_serial_child("fix login").expect("child builds");
+        let mut names: Vec<String> = child
+            .tool_definitions(None)
+            .await
+            .expect("defs resolve")
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "bash",
+                "edit",
+                "git_diff",
+                "git_status",
+                "glob",
+                "grep",
+                "list_directory",
+                "read",
+                "todowrite",
+                "web_fetch",
+                "web_search",
+                "write",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn serial_child_shares_parent_approval_channel() {
+        // Serialized approvals: the child gate must park Confirm verdicts
+        // on the same channel the Approver already answers.
+        let agent = test_agent();
+        let runner = agent.test_task_runner();
+        assert!(
+            runner.gate.shares_approval_channel(&agent.gate),
+            "child gate must share the parent approval channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_child_construction_leaves_parent_history_untouched() {
+        // Fresh-context isolation at construction: building the child must
+        // never clone or summarize parent history. (`run_child` itself
+        // starts from `Context::new()` per attempt; the live-LLM turn is
+        // covered by the Tool-seam fake-runner tests, not here.)
+        let agent = test_agent();
+        let mut ctx = crate::context::Context::new();
+        ctx.messages_mut()
+            .push(rig::message::Message::user("remember the plan"));
+        let before = ctx.to_json().unwrap();
+        agent.import_sync(&before).unwrap();
+        let _child = agent.build_serial_child("fix login").expect("child builds");
+        assert_eq!(agent.export_sync().unwrap(), before);
     }
 
     #[test]

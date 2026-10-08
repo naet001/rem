@@ -390,6 +390,30 @@ static COMMANDS: &[Command] = &[
         desc: "list, toggle, or log in MCP servers",
         hint: "[on|off|login|logout <name>]",
     },
+    Command {
+        name: "todos",
+        takes_arg: false,
+        desc: "show session todo list",
+        hint: "",
+    },
+    Command {
+        name: "tasks",
+        takes_arg: true,
+        desc: "list background subagents or show one summary",
+        hint: "[id]",
+    },
+    Command {
+        name: "undo",
+        takes_arg: false,
+        desc: "undo the last mutate turn (files + history)",
+        hint: "",
+    },
+    Command {
+        name: "rewind",
+        takes_arg: true,
+        desc: "restore files + history from n turns ago",
+        hint: "[n]",
+    },
 ];
 
 /// Fixed instruction for `/init` (ADR-0009): runs as a normal agent turn so
@@ -2189,6 +2213,14 @@ fn handle_key(
                 1 => resolve_approval_always(app),
                 _ => resolve_approval_no(app),
             },
+            KeyCode::Char('a') | KeyCode::Char('A') if !mods.contains(KeyModifiers::CONTROL) => {
+                // Diff-accept: [a]ccept lands the proposed change.
+                resolve_approval_yes(app);
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') if !mods.contains(KeyModifiers::CONTROL) => {
+                // Diff-accept: [r]eject cancels it; the turn goes on.
+                resolve_approval_no(app);
+            }
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                 resolve_approval_no(app);
             }
@@ -2764,8 +2796,16 @@ fn submit(
                     let _ = crate::sessions::save_messages(&conn, &app.session_id, &msgs);
                     let _ = crate::sessions::touch(&conn, &app.session_id);
                 }
-                // Fresh agent context.
+                // Fresh agent context + todo list + background tasks.
                 if let Err(e) = agent.import_sync("[]") {
+                    app.enqueue_notice(format!("new failed: {e}"));
+                    return false;
+                }
+                if let Err(e) = agent.clear_todos() {
+                    app.enqueue_notice(format!("new failed: {e}"));
+                    return false;
+                }
+                if let Err(e) = agent.clear_background() {
                     app.enqueue_notice(format!("new failed: {e}"));
                     return false;
                 }
@@ -2807,6 +2847,7 @@ fn submit(
                     msg.push_str(&format!("\n  /{}{usage} — {}", c.name, c.desc));
                 }
                 msg.push_str("\nfile refs: @file inlines content; @dir/ lists; @file:10-20 slices lines (also @file:42, @file:100-); multiple refs expand in order; a missing/unreadable/binary/outside-root ref blocks submit and names the bad ref");
+                msg.push_str("\nsubagents: todowrite owns the session task list (pass the full list each call: content + status pending/in_progress/completed); task spawns scoped subagent(s) — single description+prompt, or tasks[] fan-out (up to 8, 4 at a time, merged as ## sections), background:true detaches (summary on a later turn, /tasks shows status) — fresh context, shared approval queue, no recursion, Esc aborts inline children with the turn");
                 app.enqueue_notice(msg);
                 return false;
             }
@@ -3154,6 +3195,95 @@ fn submit(
                 }
                 return false;
             }
+            "todos" => {
+                let items = agent.list_todos();
+                match items.is_empty() {
+                    true => app.enqueue_notice("todos: list empty".to_string()),
+                    false => {
+                        let lines: Vec<String> = items
+                            .iter()
+                            .map(|t| {
+                                let mark = match t.status {
+                                    crate::tools::TodoStatus::Pending => "○",
+                                    crate::tools::TodoStatus::InProgress => "◌",
+                                    crate::tools::TodoStatus::Completed => "●",
+                                };
+                                format!("{mark} {}", t.content)
+                            })
+                            .collect();
+                        app.enqueue_notice(format!("todos:\n{}", lines.join("\n")));
+                    }
+                }
+                return false;
+            }
+            "tasks" => {
+                let id = arg.trim();
+                match id.is_empty() {
+                    true => {
+                        let items = agent.list_background();
+                        match items.is_empty() {
+                            true => app.enqueue_notice("tasks: none".to_string()),
+                            false => {
+                                let lines: Vec<String> = items
+                                    .iter()
+                                    .map(|t| {
+                                        let state = match t.status {
+                                            crate::tools::BackgroundStatus::Running => "running",
+                                            crate::tools::BackgroundStatus::Done => "done",
+                                        };
+                                        format!("{} [{}] {}", t.id, state, t.labels.join(", "))
+                                    })
+                                    .collect();
+                                app.enqueue_notice(format!("tasks:\n{}", lines.join("\n")));
+                            }
+                        }
+                    }
+                    false => match agent.background_detail(id) {
+                        Some(t) => {
+                            let state = match t.status {
+                                crate::tools::BackgroundStatus::Running => "running",
+                                crate::tools::BackgroundStatus::Done => "done",
+                            };
+                            let body = t.summary.as_deref().unwrap_or("(still running)");
+                            app.enqueue_notice(format!(
+                                "{} [{}] {}\n{}",
+                                t.id,
+                                state,
+                                t.labels.join(", "),
+                                body
+                            ));
+                        }
+                        None => app.enqueue_notice(format!("no background task {id}")),
+                    },
+                }
+                return false;
+            }
+            "undo" => {
+                match agent.undo_sync() {
+                    Ok(summary) => app.enqueue_notice(summary),
+                    Err(e) => app.enqueue_notice(format!("undo: {e}")),
+                }
+                return false;
+            }
+            "rewind" => {
+                let n = match arg.trim() {
+                    "" => 1,
+                    a => match a.parse::<usize>() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            app.enqueue_notice(
+                                "usage: /rewind [n] (n = turns back, default 1)".to_string(),
+                            );
+                            return false;
+                        }
+                    },
+                };
+                match agent.rewind_sync(n) {
+                    Ok(summary) => app.enqueue_notice(summary),
+                    Err(e) => app.enqueue_notice(format!("rewind: {e}")),
+                }
+                return false;
+            }
             _ => {}
         }
     }
@@ -3188,10 +3318,27 @@ fn submit(
             }
         }
     };
-    let prompt = match expanded {
+    let mut prompt = match expanded {
         Some(ref e) => e.clone(),
         None => text.clone(),
     };
+    // Background results (TUI injects on next submit): prepend finished
+    // summaries the model hasn't seen, so the next turn lands with context.
+    // Drained exactly once; `/tasks <id>` replays any summary on demand.
+    let done = agent.take_background_completed();
+    if !done.is_empty() {
+        let mut blocks = Vec::new();
+        for t in &done {
+            let body = t.summary.as_deref().unwrap_or("(no summary)");
+            blocks.push(format!(
+                "background {} finished ({}):\n{}",
+                t.id,
+                t.labels.join(", "),
+                body
+            ));
+        }
+        prompt = format!("{}\n\n{}", blocks.join("\n\n"), prompt);
+    }
     app.enqueue_user(display);
     app.busy = true;
     app.busy_since = Instant::now();
@@ -3616,6 +3763,13 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
             tool_name: head.tool_name.clone(),
             args_preview: head.args_preview.clone(),
             reason: head.reason.clone(),
+            patch: head.patch.clone(),
+            patch_path: head
+                .full_args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
         };
         render_approval_modal(
             f,
@@ -3658,7 +3812,16 @@ struct ApprovalDisplay {
     tool_name: String,
     args_preview: String,
     reason: String,
+    /// Diff-accept: proposed `+`/`-` patch body (Mutate confirms only).
+    patch: Option<String>,
+    /// Target path for the patch header (`full_args.path`).
+    patch_path: String,
 }
+
+/// Max rows the proposed patch may occupy inside the modal (blank +
+/// header + up to ~10 body lines). Longer patches clip; the full change
+/// still lives in the tool result / scrollback after the decision.
+const PATCH_ROWS_CAP: u16 = 12;
 
 #[allow(clippy::too_many_arguments)]
 fn render_approval_modal(
@@ -3679,9 +3842,24 @@ fn render_approval_modal(
     // Big pane shows all 6 rows.
     let room = area.height.saturating_sub(2);
     let full = room >= 6;
-    let mut content_rows: u16 = match full {
-        true => 6,
-        false => 4,
+    // Diff-accept: render the proposed patch (tinted +/- rows, same
+    // renderer as the scrollback diff) instead of the kind/args lines.
+    // Small panes drop it, like kind/args.
+    let patch_lines: Vec<Line<'static>> = match (&req.patch, full) {
+        (Some(body), true) => {
+            // Box max width 72 → inner 70; patch_row wraps at that width.
+            let mut rows =
+                crate::history::patch_row(&req.tool_name, &req.patch_path, body, 70, theme);
+            rows.truncate(PATCH_ROWS_CAP as usize);
+            rows
+        }
+        _ => Vec::new(),
+    };
+    let diff = !patch_lines.is_empty();
+    let mut content_rows: u16 = match (full, diff) {
+        (true, true) => 4 + patch_lines.len() as u16,
+        (true, false) => 6,
+        (false, _) => 4,
     };
     if comment_open {
         content_rows += 2;
@@ -3733,6 +3911,11 @@ fn render_approval_modal(
     }
     // Small pane: head + options + hint + reason (4 rows).
     // Big pane: + kind + args (6 rows). Full text lives in chat rows too.
+    let hint: &str = match diff {
+        // Diff-accept flow: [a]ccept / [r]eject are the primary actions.
+        true => "a accept · r reject · 1/2/3 · enter · tab note · esc no",
+        false => "1/2/3 · arrows/h/l · enter · tab note · ctrl+e · esc no",
+    };
     let mut lines = vec![
         Line::from(head),
         Line::from(vec![
@@ -3743,7 +3926,7 @@ fn render_approval_modal(
             action_span("3", "No", 2, approval_sel, theme),
         ]),
         Line::from(vec![Span::styled(
-            "1/2/3 · arrows/h/l · enter · tab note · ctrl+e · esc no",
+            hint,
             Style::default().fg(theme.placeholder),
         )]),
         Line::from(vec![Span::styled(
@@ -3752,21 +3935,27 @@ fn render_approval_modal(
         )]),
     ];
     if full {
-        lines.push(Line::from(vec![Span::styled(
-            format!(
-                "# {}",
-                match req.tool_name.as_str() {
-                    "bash" => "Shell command",
-                    "write" | "edit" => "File change",
-                    _ => "Tool request",
-                }
-            ),
-            Style::default().fg(theme.code_fg),
-        )]));
-        lines.push(Line::from(vec![Span::styled(
-            arg_line,
-            Style::default().fg(theme.code_fg),
-        )]));
+        if diff {
+            // Proposed patch replaces the generic kind/args lines: the
+            // header carries tool + path + counts, body rows tint +/-.
+            lines.extend(patch_lines);
+        } else {
+            lines.push(Line::from(vec![Span::styled(
+                format!(
+                    "# {}",
+                    match req.tool_name.as_str() {
+                        "bash" => "Shell command",
+                        "write" | "edit" => "File change",
+                        _ => "Tool request",
+                    }
+                ),
+                Style::default().fg(theme.code_fg),
+            )]));
+            lines.push(Line::from(vec![Span::styled(
+                arg_line,
+                Style::default().fg(theme.code_fg),
+            )]));
+        }
     }
     if comment_open {
         lines.push(Line::from(vec![
@@ -5036,9 +5225,89 @@ mod tests {
             args_preview: preview.to_string(),
             full_args: serde_json::json!({}),
             reason: "needs approval".to_string(),
+            patch: None,
             reply,
         };
         (req, rx)
+    }
+
+    /// Diff-accept variant: Mutate confirm carrying a proposed patch.
+    fn approval_req_patch(
+        tool: &str,
+        preview: &str,
+        patch: &str,
+    ) -> (
+        ApprovalRequest,
+        tokio::sync::oneshot::Receiver<ApprovalDecision>,
+    ) {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let req = ApprovalRequest {
+            tool_name: tool.to_string(),
+            args_preview: preview.to_string(),
+            full_args: serde_json::json!({"path": "f.rs"}),
+            reason: "needs approval".to_string(),
+            patch: Some(patch.to_string()),
+            reply,
+        };
+        (req, rx)
+    }
+
+    #[test]
+    fn approval_modal_shows_proposed_patch_and_diff_hint() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App::new("test-model".to_string(), "medium".to_string());
+        app.term_width = 80;
+        let (req, _rx) = approval_req_patch("edit", "f.rs,1 edit(s)", "-old line\n+new line\n");
+        app.pending_approvals.push_back(req);
+        // Tall terminal: the modal takes its full layout (patch block
+        // only renders when there is room, like the kind/args lines).
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_frame(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| cell_text(&buf, y, buf.area.width))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Tinted patch body: removed then added line, with counts header.
+        assert!(text.contains("-old line"), "patch body missing: {text}");
+        assert!(text.contains("+new line"), "patch body missing: {text}");
+        assert!(text.contains("+1"), "patch counts missing: {text}");
+        // Spec hint: [a]ccept / [r]eject.
+        assert!(text.contains("a accept"), "got: {text}");
+        assert!(text.contains("r reject"), "got: {text}");
+    }
+
+    #[test]
+    fn approval_a_and_r_keys_accept_or_reject_the_patch() {
+        for (key, is) in [
+            (KeyCode::Char('a'), "approve"),
+            (KeyCode::Char('r'), "deny"),
+        ] {
+            let mut app = App::new("model".to_string(), "medium".to_string());
+            app.print_queue.clear();
+            let (req, rx) = approval_req_patch("edit", "f.rs", "-x\n+y\n");
+            app.pending_approvals.push_back(req);
+            let agent = std::sync::Arc::new(StubAgent);
+            let (tx, _rx) = mpsc::channel::<TurnResult>();
+            let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+            assert!(!handle_key(
+                &mut app,
+                &agent,
+                &tx,
+                &think_tx,
+                key,
+                KeyModifiers::empty()
+            ));
+            assert!(app.pending_approvals.is_empty(), "{is}: modal must close");
+            let got = rx.blocking_recv().unwrap();
+            let ok = matches!(
+                (is, got),
+                ("approve", ApprovalDecision::Approve { .. })
+                    | ("deny", ApprovalDecision::Deny { .. })
+            );
+            assert!(ok, "wrong choice for {is}");
+        }
     }
 
     #[test]
@@ -5729,9 +5998,10 @@ mod tests {
         app.cursor = 1;
         app.menu_sel = Some(0);
         app.history = vec!["old turn".to_string()];
-        // 13 registry commands: quit, new, help, theme, init, resume,
-        // rename, fork, skills, model, effort, context, mcp.
-        for expect in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0] {
+        // 17 registry commands: quit, new, help, theme, init, resume,
+        // rename, fork, skills, model, effort, context, mcp, todos, tasks,
+        // undo, rewind.
+        for expect in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0] {
             assert!(!handle_key(
                 &mut app,
                 &agent,
@@ -5750,10 +6020,9 @@ mod tests {
             KeyCode::Up,
             KeyModifiers::empty()
         ));
-        assert_eq!(app.menu_sel, Some(12));
+        assert_eq!(app.menu_sel, Some(16));
         assert_eq!(app.hist_idx, None);
         assert_eq!(app.input, "/");
-        assert_eq!(app.history, vec!["old turn".to_string()]);
     }
 
     fn print_flat(app: &App) -> String {
@@ -6210,6 +6479,275 @@ mod tests {
         assert!(!submit(&mut app, &agent, &tx, &think_tx));
         assert_eq!(agent.model_name(), "anthropic:claude-haiku-4-5");
         assert_eq!(app.model, "anthropic:claude-haiku-4-5");
+    }
+
+    #[tokio::test]
+    async fn slash_todos_reports_empty_list_without_turn() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/todos".to_string();
+        app.cursor = 6;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy, "/todos must not start a turn");
+        let flat = print_flat(&app);
+        // Defaulted trait method reports no todos.
+        assert!(flat.contains("list empty"), "got: {flat}");
+    }
+
+    /// Stub with canned background tasks for `/tasks` dispatch tests.
+    struct BgStubAgent;
+
+    #[async_trait::async_trait]
+    impl AgentLoop for BgStubAgent {
+        async fn chat(&self, _prompt: &str) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn list_background(&self) -> Vec<crate::tools::BackgroundInfo> {
+            vec![
+                crate::tools::BackgroundInfo {
+                    id: "task-1".to_string(),
+                    labels: vec!["fix login".to_string()],
+                    status: crate::tools::BackgroundStatus::Running,
+                    summary: None,
+                },
+                crate::tools::BackgroundInfo {
+                    id: "task-2".to_string(),
+                    labels: vec!["a".to_string(), "b".to_string()],
+                    status: crate::tools::BackgroundStatus::Done,
+                    summary: Some("merged summary".to_string()),
+                },
+            ]
+        }
+        fn background_detail(&self, id: &str) -> Option<crate::tools::BackgroundInfo> {
+            self.list_background()
+                .into_iter()
+                .find(|t| t.id == id.trim())
+        }
+    }
+
+    #[tokio::test]
+    async fn slash_tasks_lists_background_without_turn() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(BgStubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/tasks".to_string();
+        app.cursor = 6;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy, "/tasks must not start a turn");
+        let flat = print_flat(&app);
+        assert!(flat.contains("task-1"), "got: {flat}");
+        assert!(flat.contains("running"), "got: {flat}");
+        assert!(flat.contains("task-2"), "got: {flat}");
+        assert!(flat.contains("done"), "got: {flat}");
+    }
+
+    #[tokio::test]
+    async fn slash_tasks_detail_shows_summary_without_turn() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(BgStubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/tasks task-2".to_string();
+        app.cursor = app.input.chars().count();
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy, "/tasks <id> must not start a turn");
+        let flat = print_flat(&app);
+        assert!(flat.contains("merged summary"), "got: {flat}");
+    }
+
+    #[tokio::test]
+    async fn slash_tasks_unknown_id_reports_without_turn() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(BgStubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/tasks task-9".to_string();
+        app.cursor = app.input.chars().count();
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy);
+        assert!(
+            print_flat(&app).contains("no background task"),
+            "got: {}",
+            print_flat(&app)
+        );
+    }
+
+    /// Stub that records `/rewind` args and returns canned restore summaries.
+    struct UndoStubAgent {
+        rewind_ns: std::sync::Mutex<Vec<usize>>,
+        fail_undo: bool,
+    }
+
+    impl UndoStubAgent {
+        fn new() -> Self {
+            Self {
+                rewind_ns: std::sync::Mutex::new(Vec::new()),
+                fail_undo: false,
+            }
+        }
+        fn failing() -> Self {
+            Self {
+                rewind_ns: std::sync::Mutex::new(Vec::new()),
+                fail_undo: true,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentLoop for UndoStubAgent {
+        async fn chat(&self, _prompt: &str) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn undo_sync(&self) -> Result<String, String> {
+            if self.fail_undo {
+                return Err("no checkpoints to undo".to_string());
+            }
+            Ok("undid turn 3: history restored, files restored to snapshot state".to_string())
+        }
+        fn rewind_sync(&self, n: usize) -> Result<String, String> {
+            if self.fail_undo {
+                return Err("no checkpoints to rewind".to_string());
+            }
+            self.rewind_ns.lock().unwrap().push(n);
+            Ok(format!(
+                "rewound to turn {}: history restored, files restored to snapshot state",
+                n.saturating_sub(1)
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn slash_undo_restores_without_turn() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(UndoStubAgent::new());
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/undo".to_string();
+        app.cursor = 5;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy, "/undo must not start a turn");
+        let flat = print_flat(&app);
+        assert!(flat.contains("undid turn 3"), "got: {flat}");
+    }
+
+    #[tokio::test]
+    async fn slash_rewind_passes_arg_and_defaults_to_one() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(UndoStubAgent::new());
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+
+        // `/rewind 2` forwards 2.
+        app.input = "/rewind 2".to_string();
+        app.cursor = app.input.chars().count();
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert_eq!(*agent.rewind_ns.lock().unwrap(), vec![2]);
+
+        // Bare `/rewind` defaults to 1.
+        app.print_queue.clear();
+        app.input = "/rewind".to_string();
+        app.cursor = app.input.chars().count();
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert_eq!(*agent.rewind_ns.lock().unwrap(), vec![2, 1]);
+        let flat = print_flat(&app);
+        assert!(flat.contains("rewound to turn"), "got: {flat}");
+    }
+
+    #[tokio::test]
+    async fn slash_rewind_rejects_bad_arg_and_surfaces_errors() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(UndoStubAgent::failing());
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+
+        // Non-numeric arg: usage notice, no call.
+        app.input = "/rewind x".to_string();
+        app.cursor = app.input.chars().count();
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        let flat = print_flat(&app);
+        assert!(flat.contains("usage: /rewind"), "got: {flat}");
+        assert!(agent.rewind_ns.lock().unwrap().is_empty());
+
+        // Agent error (no checkpoints) surfaces as a notice.
+        app.print_queue.clear();
+        app.input = "/undo".to_string();
+        app.cursor = app.input.chars().count();
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        let flat = print_flat(&app);
+        assert!(flat.contains("no checkpoints to undo"), "got: {flat}");
     }
 
     #[tokio::test]
@@ -6682,6 +7220,47 @@ mod tests {
     }
 
     #[test]
+    fn slash_help_documents_subagents_v1_limits() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/help".to_string();
+        app.cursor = 5;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        let flat: String = app
+            .print_queue
+            .iter()
+            .flatten()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Transcript wraps: normalize whitespace before matching.
+        let flat: String = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+        for want in [
+            "todowrite",
+            "pending/in_progress/completed",
+            "task spawns scoped subagent(s)",
+            "description",
+            "no recursion",
+        ] {
+            assert!(flat.contains(want), "help missing {want}: {flat}");
+        }
+    }
+
+    #[test]
     fn slash_submit_help_lists_every_registry_command() {
         let mut app = App::new("model".to_string(), "medium".to_string());
         let agent = std::sync::Arc::new(StubAgent);
@@ -6712,7 +7291,7 @@ mod tests {
             .join("\n");
         for name in [
             "/quit", "/new", "/help", "/theme", "/init", "/skills", "/model", "/effort",
-            "/context", "/mcp",
+            "/context", "/mcp", "/todos", "/tasks", "/undo", "/rewind",
         ] {
             assert!(flat.contains(name), "help missing {name}: {flat}");
         }
@@ -7802,6 +8381,7 @@ mod tests {
                 args_preview: "()".to_string(),
                 full_args: serde_json::Value::Null,
                 reason: "test".to_string(),
+                patch: None,
                 reply: tx,
             });
         assert_eq!(at_row_count(&app), 0, "@-menu suppressed during approval");

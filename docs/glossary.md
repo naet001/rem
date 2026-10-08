@@ -82,6 +82,14 @@
 - **Reload**: `/skills reload` re-scans + rebuilds the inner agent so normal chat auto-knows new skills; history/hooks/mode preserved, fail-closed on error. Refused while busy.
 - **Lenient load**: missing `description` → first body line; bad YAML → name-only with note, direct invoke still works.
 
+## Subagents (ADR-0015, ADR-0016)
+
+- **TodoWrite**: `todowrite` tool owning the session task list (full-list replace; `content` + `status` `pending` / `in_progress` / `completed`). Agent-shared state, never persisted; `/todos` shows it, `/new` clears it. `Allow` in every mode.
+- **Task**: `task` tool spawning scoped subagent(s): single (`description` label + `prompt`) or fan-out (`tasks[]`, up to 8, 4 at a time, merged as `##` sections in input order). Fresh context per child, identical preamble + delegation note, same tools minus `task` (depth-1, no recursion), shared approval channel. Parent transcript shows one row. `Allow` in every mode; child calls gated by the same Policy.
+- **Fan-out**: bounded-parallel `tasks[]` batch on a scoped `JoinSet` (drop-the-future aborts all, so Esc works with zero TUI changes). Partial merge: per-child `## <label> (error)` blocks, never whole-batch failure.
+- **Child label**: `PermissionHook::with_task_label` clone sharing the parent approval channel; the FIFO modal shows `tool [label]` + `[subagent label]` reason so parallel Confirms attribute.
+- **Background**: `background:true` detaches the call into the session `BackgroundStore` (`task-N` ids, session-memory only, `/new` clears, headless degrades to inline). Result returns via TUI inject-on-next-submit; `/tasks` lists, `/tasks <id>` shows the summary.
+
 ## Non-goals (v1)
 
 - True OS sandboxing (namespaces, seccomp, grsecurity). The gate is a *policy + human* layer, not a kernel boundary.

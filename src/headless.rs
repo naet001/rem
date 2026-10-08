@@ -212,6 +212,9 @@ pub async fn run_print(opts: PrintOpts) -> i32 {
     {
         *guard = m;
     }
+    // Headless has no TUI loop to observe completion: `background:true`
+    // degrades to inline (same result, no polling) instead of detaching.
+    agent.set_background_enabled(false);
 
     let agent = std::sync::Arc::new(agent);
 

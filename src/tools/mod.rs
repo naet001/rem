@@ -4,7 +4,10 @@ pub mod git;
 pub mod glob_tool;
 pub mod grep;
 pub mod list_directory;
+pub mod patch;
 pub mod read;
+pub mod task;
+pub mod todo;
 pub mod web;
 pub mod write;
 
@@ -14,7 +17,12 @@ pub use git::{GitDiffTool, GitStatusTool};
 pub use glob_tool::GlobTool;
 pub use grep::GrepTool;
 pub use list_directory::ListDirectoryTool;
+pub use patch::propose_patch;
 pub use read::ReadTool;
+pub use task::{
+    BackgroundInfo, BackgroundStatus, BackgroundStore, TaskChildRunner, TaskTool, task_preview,
+};
+pub use todo::{TodoItem, TodoStatus, TodoWriteTool};
 pub use web::{WebFetchTool, WebSearchTool};
 pub use write::WriteTool;
 
