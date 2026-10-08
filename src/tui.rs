@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -24,19 +23,13 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{AgentLoop, ToolEvent};
 use crate::history;
-use crate::modes::Mode;
-use crate::permissions::{ApprovalDecision, ApprovalRequest, ApprovalRx};
 use crate::theme::Theme;
 use rig::message::{AssistantContent, Message, UserContent};
 
 /// Swappable UI abstraction. `RatatuiBackend` is the Ratatui implementation;
 /// the old Cursive backend was removed in favor of this Aster-styled UI.
 pub trait TuiBackend {
-    fn run(
-        self,
-        agent: impl AgentLoop + Send + Sync + 'static,
-        approval_rx: ApprovalRx,
-    ) -> anyhow::Result<()>;
+    fn run(self, agent: impl AgentLoop + Send + Sync + 'static) -> anyhow::Result<()>;
 }
 
 pub struct RatatuiBackend;
@@ -48,12 +41,8 @@ impl RatatuiBackend {
 }
 
 impl TuiBackend for RatatuiBackend {
-    fn run(
-        self,
-        agent: impl AgentLoop + Send + Sync + 'static,
-        approval_rx: ApprovalRx,
-    ) -> anyhow::Result<()> {
-        run_app(agent, approval_rx)
+    fn run(self, agent: impl AgentLoop + Send + Sync + 'static) -> anyhow::Result<()> {
+        run_app(agent)
     }
 }
 
@@ -128,10 +117,7 @@ impl Drop for TerminalInputMode {
     }
 }
 
-fn run_app(
-    agent: impl AgentLoop + Send + Sync + 'static,
-    approval_rx: ApprovalRx,
-) -> anyhow::Result<()> {
+fn run_app(agent: impl AgentLoop + Send + Sync + 'static) -> anyhow::Result<()> {
     let model = agent.model_name();
     let effort = agent.effort_name();
     let agent = Arc::new(agent);
@@ -183,19 +169,7 @@ fn run_app(
         {
             app.replay_json(&s.messages_json);
         }
-        // The approval channel is tokio mpsc; the TUI loop is sync crossterm, so
-        // poll with try_recv (never block the 50ms frame).
-        let mut approval_rx = approval_rx;
-        let outcome = event_loop(
-            &mut terminal,
-            &mut app,
-            agent,
-            &rx,
-            tx,
-            &think_rx,
-            think_tx,
-            &mut approval_rx,
-        );
+        let outcome = event_loop(&mut terminal, &mut app, agent, &rx, tx, &think_rx, think_tx);
 
         // Sync final id for the post-exit resume hint in main.rs: /resume,
         // /fork, and the picker mutate app.session_id after startup, and both
@@ -228,10 +202,10 @@ fn pane_viewport_area(width: u16, height: u16, pane_height: u16) -> Rect {
 /// The picker needs ~12 rows (header + filter + rows + hint + border) but
 /// the compact pane is only 6 rows, so it clipped to zero session rows.
 /// While the picker is open the viewport grows to a fixed 15 rows; closing
-/// restores the compact pane. Approval modals stay small and never trigger
-/// growth. Growth temporarily covers recent transcript rows (same tradeoff
+/// restores the compact pane. Growth temporarily covers recent transcript
+/// rows (same tradeoff
 /// as multi-line input growth); they remain in terminal scrollback.
-/// Fixed picker viewport: 14 rows (footer + 13-row modal budget).
+/// Fixed picker viewport: 14 rows (footer + 13-row picker budget).
 /// Box outer caps at 13, showing up to 8 session rows with scroll.
 const PICKER_VIEWPORT_ROWS: u16 = 14;
 /// Max session rows visible in the picker box; beyond this the list windows.
@@ -1371,16 +1345,16 @@ fn menu_height(app: &App) -> u16 {
 // ---------------------------------------------------------------------------
 
 /// True when the @ menu should show: caret is on an active @ token,
-/// no pending approvals, not busy. Suppressed when `/` menu is open.
+/// not busy. Suppressed when `/` menu is open.
 fn at_menu_open(app: &App) -> bool {
     at_row_count(app) > 0
 }
 
-/// Number of @ popup rows to render (0 when `/`-menu open, busy, or
-/// pending approval). Uses `menu_row_count_app` so the skills menu
-/// (which `menu_row_count` alone misses) also suppresses @.
+/// Number of @ popup rows to render (0 when `/`-menu open or busy).
+/// Uses `menu_row_count_app` so the skills menu (which `menu_row_count`
+/// alone misses) also suppresses @.
 fn at_row_count(app: &App) -> usize {
-    if !app.pending_approvals.is_empty() || app.busy {
+    if app.busy {
         return 0;
     }
     // /-wins: when slash menu has rows, suppress @ (skills included)
@@ -1521,7 +1495,6 @@ struct SessionPicker {
 struct App {
     model: String,
     effort: String,
-    mode: Mode,
     /// Active color theme. Swapped live by `/theme`; every render and
     /// history-row builder reads from here (no `const` colors remain).
     theme: Theme,
@@ -1559,16 +1532,6 @@ struct App {
     /// `Some(i)` = menu open with row `i` highlighted. Suppressed when
     /// the `/` menu is open (`/`-wins precedence).
     at_sel: Option<usize>,
-    /// Pending human approvals (FIFO). Head renders as a blocking modal;
-    /// resolving it resumes the parked agent worker in the same run.
-    pending_approvals: VecDeque<ApprovalRequest>,
-    approval_sel: usize,
-    /// Tab comment box text. Open on Tab, send on Enter, shut on Esc.
-    /// Shown only on Yes / No rows. Hidden note on Yes (AI only).
-    approval_comment: String,
-    approval_comment_open: bool,
-    /// Ctrl+E risk help on/off.
-    approval_explain: bool,
     /// `/new` flag: wipe screen + scrollback before the next drain.
     request_clear_screen: bool,
     /// In-flight turn worker + live-feed watcher (Task 1 / ADR-0006).
@@ -1586,80 +1549,6 @@ struct App {
     /// Freeze transcript drain for one frame after a terminal resize so
     /// queued rows cannot race viewport repositioning.
     skip_drain_once: bool,
-}
-
-/// Send head choice with typed note (Enter in note box).
-fn send_approval_with_comment(app: &mut App, comment: String) {
-    match app.approval_sel.min(2) {
-        0 => resolve_approval(app, ApprovalDecision::Approve { comment }),
-        1 => resolve_approval(app, ApprovalDecision::ApproveAlways { comment }),
-        _ => resolve_approval(app, ApprovalDecision::Deny { comment }),
-    }
-}
-
-/// Yes with empty note (1 / Enter fast path).
-fn resolve_approval_yes(app: &mut App) {
-    resolve_approval(
-        app,
-        ApprovalDecision::Approve {
-            comment: String::new(),
-        },
-    );
-}
-
-/// Yes-always (session) with empty note (2 / Enter fast path).
-fn resolve_approval_always(app: &mut App) {
-    resolve_approval(
-        app,
-        ApprovalDecision::ApproveAlways {
-            comment: String::new(),
-        },
-    );
-}
-
-/// No with empty note (3 / q / Esc fast path). Turn goes on.
-fn resolve_approval_no(app: &mut App) {
-    resolve_approval(
-        app,
-        ApprovalDecision::Deny {
-            comment: String::new(),
-        },
-    );
-}
-
-/// Resolve a queued approval: send the decision over the oneshot,
-/// print the approval rows (ADR-0005), then queue an audit notice.
-/// A dropped/closed oneshot means the worker already moved
-/// on; the request is simply forgotten.
-fn resolve_approval(app: &mut App, decision: ApprovalDecision) {
-    let Some(req) = app.pending_approvals.pop_front() else {
-        return;
-    };
-    // Print first so the decision rows land above the audit notice.
-    app.enqueue_approval_rows(&req, app.pending_approvals.len());
-    let label = match &decision {
-        ApprovalDecision::Approve { .. } => "approved",
-        ApprovalDecision::ApproveAlways { .. } => "approved (always this session)",
-        ApprovalDecision::Deny { .. } => "denied",
-    };
-    let tool_name = req.tool_name.clone();
-    let args_preview = req.args_preview.clone();
-    // Yes-note stays hidden (AI only). No-note shows in audit row.
-    let note_bit = match &decision {
-        ApprovalDecision::Deny { comment } if !comment.trim().is_empty() => {
-            format!(" note: {comment}")
-        }
-        _ => String::new(),
-    };
-    let _ = req.reply.send(decision);
-    app.enqueue_notice(format!(
-        "permission {label}: {tool_name}({args_preview}){note_bit}"
-    ));
-    // Clear box state for next head.
-    app.approval_comment.clear();
-    app.approval_comment_open = false;
-    app.approval_explain = false;
-    app.dirty = true;
 }
 
 /// Abort the in-flight turn worker + live-feed watcher (Task 1 / ADR-0006).
@@ -1709,7 +1598,6 @@ impl App {
         let mut app = Self {
             model,
             effort,
-            mode: Mode::default(),
             theme,
             print_queue: Vec::new(),
             input: String::new(),
@@ -1729,11 +1617,6 @@ impl App {
             skill_names: Vec::new(),
             model_names: Vec::new(),
             at_sel: None,
-            pending_approvals: VecDeque::new(),
-            approval_sel: 0,
-            approval_comment: String::new(),
-            approval_comment_open: false,
-            approval_explain: false,
             current_turn: None,
             current_watcher: None,
             turn_generation: 0,
@@ -1770,18 +1653,6 @@ impl App {
     fn enqueue_trailer(&mut self, text: String) {
         let w = self.term_width;
         self.enqueue(history::trailer_row(&text, w as usize));
-    }
-
-    fn enqueue_approval_rows(&mut self, req: &ApprovalRequest, queued: usize) {
-        let w = self.term_width;
-        self.enqueue(history::approval_rows(
-            &req.tool_name,
-            &req.args_preview,
-            &req.reason,
-            queued,
-            w as usize,
-            &self.theme,
-        ));
     }
 
     /// Print one finished tool row group straight to scrollback (live
@@ -1926,12 +1797,11 @@ impl App {
     }
 }
 
-/// Main loop: drains turn/live/approval channels, prints finished rows
+/// Main loop: drains turn/live channels, prints finished rows
 /// above the bottom-anchored pane, renders it, and routes input.
-/// Eight args is one over the default lint: the five channels plus terminal,
+/// Seven args is at the default lint limit: the four channels plus terminal,
 /// app, and agent are each a distinct pipe and bundling them would obscure
 /// the drain order below.
-#[allow(clippy::too_many_arguments)]
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -1940,7 +1810,6 @@ fn event_loop(
     tx: mpsc::Sender<TurnResult>,
     think_rx: &mpsc::Receiver<ThinkMsg>,
     think_tx: mpsc::Sender<ThinkMsg>,
-    approval_rx: &mut ApprovalRx,
 ) -> anyhow::Result<()> {
     // Track the viewport width so row groups wrap correctly; refreshed
     // every frame from the terminal size. Stores the REAL width for
@@ -1970,19 +1839,6 @@ fn event_loop(
                 app.streamed_tools += 1;
                 app.dirty = true;
             }
-        }
-        // Drain approval requests into the modal queue. The agent worker is
-        // parked on its oneshot; the same run resumes on resolve.
-        // Approval rows print into scrollback the moment the modal owns
-        // the keys (ADR-0005); the pane underneath keeps the status row.
-        while let Ok(req) = approval_rx.try_recv() {
-            if app.pending_approvals.is_empty() {
-                app.approval_sel = 0;
-            }
-            let queued = app.pending_approvals.len() + 1;
-            app.enqueue_approval_rows(&req, queued);
-            app.pending_approvals.push_back(req);
-            app.dirty = true;
         }
         // Drain completed turns without blocking the UI.
         // D2: a `tx.send` that wins the send-then-abort race arrives with a
@@ -2028,7 +1884,7 @@ fn event_loop(
         // pane draw below never overlaps them.
         drain_print_queue(terminal, app).context("print transcript")?;
 
-        if app.dirty || app.busy || !app.pending_approvals.is_empty() {
+        if app.dirty || app.busy {
             // Refresh width: a resize between frames re-wraps future rows.
             // Already-queued groups wrapped at enqueue width; rows are
             // short-lived (one frame) so drift is bounded to a frame.
@@ -2145,89 +2001,6 @@ fn handle_key(
     code: KeyCode,
     mods: KeyModifiers,
 ) -> bool {
-    // Approval modal owns every keystroke while pending.
-    // Yes / Yes always (session) / No. 1/2/3 pick. Arrows + h/l move.
-    // Enter sends. Tab opens note box. Ctrl+E shows risk help.
-    // Esc or q = Deny (turn goes on). Never silent: worker gets a choice.
-    if !app.pending_approvals.is_empty() {
-        // Ctrl+E = risk help on/off. Ctrl+D = deny head then quit-if-empty.
-        if mods.contains(KeyModifiers::CONTROL) {
-            if code == KeyCode::Char('e') {
-                app.approval_explain = !app.approval_explain;
-                return false;
-            }
-            if code == KeyCode::Char('d') {
-                return handle_ctrl(app, code);
-            }
-            return false;
-        }
-        // Note box open: type text, Enter sends, Esc shuts box.
-        if app.approval_comment_open {
-            match code {
-                KeyCode::Esc => {
-                    app.approval_comment_open = false;
-                    return false;
-                }
-                KeyCode::Enter => {
-                    let comment = std::mem::take(&mut app.approval_comment);
-                    app.approval_comment_open = false;
-                    send_approval_with_comment(app, comment);
-                    return false;
-                }
-                KeyCode::Backspace => {
-                    app.approval_comment.pop();
-                    return false;
-                }
-                KeyCode::Char(c) => {
-                    app.approval_comment.push(c);
-                    return false;
-                }
-                _ => return false,
-            }
-        }
-        match code {
-            KeyCode::Char('h') | KeyCode::Left => {
-                app.approval_sel = app.approval_sel.saturating_sub(1);
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                app.approval_sel = (app.approval_sel + 1).min(2);
-            }
-            KeyCode::Char('1') => {
-                app.approval_sel = 0;
-                resolve_approval_yes(app);
-            }
-            KeyCode::Char('2') => {
-                app.approval_sel = 1;
-                resolve_approval_always(app);
-            }
-            KeyCode::Char('3') => {
-                app.approval_sel = 2;
-                resolve_approval_no(app);
-            }
-            KeyCode::Tab | KeyCode::BackTab => {
-                // Note box only on Yes / No rows.
-                app.approval_comment_open = true;
-            }
-            KeyCode::Enter => match app.approval_sel {
-                0 => resolve_approval_yes(app),
-                1 => resolve_approval_always(app),
-                _ => resolve_approval_no(app),
-            },
-            KeyCode::Char('a') | KeyCode::Char('A') if !mods.contains(KeyModifiers::CONTROL) => {
-                // Diff-accept: [a]ccept lands the proposed change.
-                resolve_approval_yes(app);
-            }
-            KeyCode::Char('r') | KeyCode::Char('R') if !mods.contains(KeyModifiers::CONTROL) => {
-                // Diff-accept: [r]eject cancels it; the turn goes on.
-                resolve_approval_no(app);
-            }
-            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
-                resolve_approval_no(app);
-            }
-            _ => {}
-        }
-        return false;
-    }
     if mods.contains(KeyModifiers::CONTROL) && app.session_picker.is_none() {
         return handle_ctrl(app, code);
     }
@@ -2495,14 +2268,6 @@ fn handle_key(
         KeyCode::Enter => return submit(app, agent, tx, think_tx),
         // Tab is unbound in the scrollback model (ADR-0005): no block
         // selection exists. Kept as a no-op so the key stays free.
-        KeyCode::BackTab | KeyCode::Tab if mods.contains(KeyModifiers::SHIFT) => {
-            let next = app.mode.next();
-            app.mode = next;
-            if let Ok(mut mode) = agent.mode_handle().lock() {
-                *mode = next;
-            }
-            app.enqueue_notice(format!("permission mode: {}", next.label()));
-        }
         KeyCode::Tab | KeyCode::BackTab => {}
         KeyCode::Backspace => {
             if app.cursor > 0 {
@@ -2561,8 +2326,7 @@ fn handle_ctrl(app: &mut App, code: KeyCode) -> bool {
         }
         // Task 4 / ADR-0006: Ctrl+C is strict clear-only — clears the
         // input line, never interrupts, never quits (quit is Ctrl+D-on-empty
-        // or /quit). Ignored in the modal via the CONTROL early-return in
-        // `handle_key` above.
+        // or /quit).
         KeyCode::Char('c') => {
             app.input.clear();
             app.cursor = 0;
@@ -2582,17 +2346,13 @@ fn handle_ctrl(app: &mut App, code: KeyCode) -> bool {
         }
         KeyCode::Char('d') => {
             // Ctrl+D quits only when the input line is empty — non-empty
-            // is a no-op. Empty + modal: deny head (Skip, turn goes on),
-            // then quit. Empty + busy: `abort_turn` synthesizes the
+            // is a no-op. Empty + busy: `abort_turn` synthesizes the
             // interrupted trailer (and bumps the generation so a late
             // TurnResult is stale-dropped), then quit. Empty + idle:
             // quit directly.
             if !app.input.is_empty() {
                 false
             } else {
-                if !app.pending_approvals.is_empty() {
-                    resolve_approval_no(app);
-                }
                 if app.busy {
                     abort_turn(app);
                 }
@@ -2828,11 +2588,6 @@ fn submit(
                             app.print_queue.clear();
                             app.streamed_tools = 0;
                             app.session_picker = None;
-                            app.pending_approvals.clear();
-                            app.approval_sel = 0;
-                            app.approval_comment.clear();
-                            app.approval_comment_open = false;
-                            app.approval_explain = false;
                             app.request_clear_screen = true;
                             app.enqueue_notice("new session.".to_string());
                         }
@@ -2847,7 +2602,7 @@ fn submit(
                     msg.push_str(&format!("\n  /{}{usage} — {}", c.name, c.desc));
                 }
                 msg.push_str("\nfile refs: @file inlines content; @dir/ lists; @file:10-20 slices lines (also @file:42, @file:100-); multiple refs expand in order; a missing/unreadable/binary/outside-root ref blocks submit and names the bad ref");
-                msg.push_str("\nsubagents: todowrite owns the session task list (pass the full list each call: content + status pending/in_progress/completed); task spawns scoped subagent(s) — single description+prompt, or tasks[] fan-out (up to 8, 4 at a time, merged as ## sections), background:true detaches (summary on a later turn, /tasks shows status) — fresh context, shared approval queue, no recursion, Esc aborts inline children with the turn");
+                msg.push_str("\nsubagents: todowrite owns the session task list (pass the full list each call: content + status pending/in_progress/completed); task spawns scoped subagent(s) — single description+prompt, or tasks[] fan-out (up to 8, 4 at a time, merged as ## sections), background:true detaches (summary on a later turn, /tasks shows status) — fresh context, no recursion, Esc aborts inline children with the turn");
                 app.enqueue_notice(msg);
                 return false;
             }
@@ -3706,7 +3461,7 @@ fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
 
 /// Bottom-pane chrome (gap + status + input + footer) painted into
 /// `area`. All popups float over the pane: slash menu (float box above
-/// input), session box, approval box. Viewport stays small, chat safe.
+/// input) and session box. Viewport stays small, chat safe.
 fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals: bool) {
     let required_height = app.pane_height(area.width);
     if area.width < 20 || area.height < required_height {
@@ -3721,7 +3476,7 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
     let input_h = app.input_band_height(area.width, menu_open);
     // Bottom-anchor the pane chrome: in the compact viewport pane_area ==
     // area, but when the picker expands the viewport the composer stays on
-    // the bottom rows just above the footer and the modal floats above it.
+    // the bottom rows just above the footer and the picker floats above it.
     let required = required_height.min(area.height);
     let pane_area = Rect::new(
         area.x,
@@ -3733,7 +3488,7 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),        // gap (terminal bg)
-            Constraint::Length(status_h), // status (busy/approval/idle)
+            Constraint::Length(status_h), // status (busy/idle)
             Constraint::Length(input_h),  // shaded input band
             Constraint::Length(1),        // footer
         ])
@@ -3746,281 +3501,30 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
     render_footer(f, app, chunks[3]);
     // Float slash menu over pane, above input line.
     render_menu_float(f, app, area);
-    // Modal float area: everything above the footer row of the full area.
+    // Picker float area: everything above the footer row of the full area.
     // Box bottom-anchors here (see popup::render_float), covering the
     // composer while open; footer stays visible below.
-    let modal_area = Rect {
+    let picker_area = Rect {
         height: area.height.saturating_sub(1),
         ..area
     };
-    // Approval modal last: small float box over the pane.
-    if with_modals && app.pending_approvals.front().is_some() {
-        let queued = app.pending_approvals.len();
-        // Clone the head request (oneshot sender is not Clone, so rebuild
-        // a display-only copy without touching the queue).
-        let head = app.pending_approvals.front().expect("checked above");
-        let display = ApprovalDisplay {
-            tool_name: head.tool_name.clone(),
-            args_preview: head.args_preview.clone(),
-            reason: head.reason.clone(),
-            patch: head.patch.clone(),
-            patch_path: head
-                .full_args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        };
-        render_approval_modal(
-            f,
-            modal_area,
-            &display,
-            queued,
-            app.approval_sel,
-            app.approval_comment_open,
-            &app.approval_comment,
-            app.approval_explain,
-            &app.theme,
-        );
-    }
     if with_modals && app.session_picker.is_some() {
-        render_session_picker(f, app, modal_area, &app.theme);
+        render_session_picker(f, app, picker_area, &app.theme);
     }
     // Keep the caret on the composer's text row in the shaded band.
     // `cursor_position` is the multiline-aware helper (dev): it accounts for
     // the resized composer and input scroll, which the sessions-side
     // `cursor_x` single-line path did not.
-    if app.session_picker.is_none() && app.pending_approvals.is_empty() {
+    if app.session_picker.is_none() {
         f.set_cursor_position(cursor_position(app, chunks[2]));
     }
 }
 
 fn render_frame(f: &mut ratatui::Frame, app: &mut App) {
     // The session picker expands the viewport (see `viewport_height`) so
-    // its fixed 12-15 row box fits; approval modals stay small and float
-    // over the compact pane. Keys are owned by the modal (`handle_key`).
+    // its fixed 12-15 row box fits. Keys are owned by the picker
+    // (`handle_key`).
     render_pane(f, app);
-}
-
-/// Bottom-anchored approval sheet: shaded band with the request + key hints.
-/// The request rows already printed into scrollback when the modal took
-/// over; this sheet is the live decision surface. `handle_key` blocks input
-/// routing until resolved.
-/// Display-only snapshot of an approval head for the modal sheet.
-/// (The live `ApprovalRequest` owns a oneshot sender and cannot be cloned.)
-struct ApprovalDisplay {
-    tool_name: String,
-    args_preview: String,
-    reason: String,
-    /// Diff-accept: proposed `+`/`-` patch body (Mutate confirms only).
-    patch: Option<String>,
-    /// Target path for the patch header (`full_args.path`).
-    patch_path: String,
-}
-
-/// Max rows the proposed patch may occupy inside the modal (blank +
-/// header + up to ~10 body lines). Longer patches clip; the full change
-/// still lives in the tool result / scrollback after the decision.
-const PATCH_ROWS_CAP: u16 = 12;
-
-#[allow(clippy::too_many_arguments)]
-fn render_approval_modal(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    req: &ApprovalDisplay,
-    queued: usize,
-    approval_sel: usize,
-    comment_open: bool,
-    comment: &str,
-    explain: bool,
-    theme: &Theme,
-) {
-    // Small float box. 1 Yes · 2 Yes always (this chat) · 3 No.
-    // Tab = note box. Ctrl+E = risk help.
-    // Fits 6-row pane: head + reason + options + hint = 4 rows + border.
-    // Kind/args lines drop in small pane (full text is in chat rows).
-    // Big pane shows all 6 rows.
-    let room = area.height.saturating_sub(2);
-    let full = room >= 6;
-    // Diff-accept: render the proposed patch (tinted +/- rows, same
-    // renderer as the scrollback diff) instead of the kind/args lines.
-    // Small panes drop it, like kind/args.
-    let patch_lines: Vec<Line<'static>> = match (&req.patch, full) {
-        (Some(body), true) => {
-            // Box max width 72 → inner 70; patch_row wraps at that width.
-            let mut rows =
-                crate::history::patch_row(&req.tool_name, &req.patch_path, body, 70, theme);
-            rows.truncate(PATCH_ROWS_CAP as usize);
-            rows
-        }
-        _ => Vec::new(),
-    };
-    let diff = !patch_lines.is_empty();
-    let mut content_rows: u16 = match (full, diff) {
-        (true, true) => 4 + patch_lines.len() as u16,
-        (true, false) => 6,
-        (false, _) => 4,
-    };
-    if comment_open {
-        content_rows += 2;
-    }
-    if explain {
-        content_rows += 3;
-    }
-    let max_content = area.height.saturating_sub(2).max(1);
-    let content_rows = content_rows.min(max_content);
-    let h = content_rows + 2;
-    let _ = full;
-    let inner = crate::popup::render_float(f, area, h, 72, theme);
-    if inner.height < 2 || inner.width < 20 {
-        return;
-    }
-    let arg_line = match req.args_preview.chars().count() > inner.width as usize {
-        true => format!(
-            "{}…",
-            req.args_preview
-                .chars()
-                .take(inner.width as usize - 1)
-                .collect::<String>()
-        ),
-        false => req.args_preview.clone(),
-    };
-    let risk = if req.tool_name == "bash" && req.reason.to_lowercase().contains("network") {
-        ("NETWORK", theme.heading_h3)
-    } else if req.tool_name == "write" || req.tool_name == "edit" {
-        ("FILE CHANGE", theme.add_fg)
-    } else {
-        ("REVIEW REQUIRED", theme.accent)
-    };
-    let mut head: Vec<Span<'static>> = vec![
-        Span::styled("◌ ", Style::default().fg(theme.accent)),
-        Span::styled(
-            "Permission required".to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  [{}]", risk.0),
-            Style::default().fg(risk.1).add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if queued > 1 {
-        head.push(Span::styled(
-            format!(" (1 of {queued})"),
-            Style::default().fg(theme.placeholder),
-        ));
-    }
-    // Small pane: head + options + hint + reason (4 rows).
-    // Big pane: + kind + args (6 rows). Full text lives in chat rows too.
-    let hint: &str = match diff {
-        // Diff-accept flow: [a]ccept / [r]eject are the primary actions.
-        true => "a accept · r reject · 1/2/3 · enter · tab note · esc no",
-        false => "1/2/3 · arrows/h/l · enter · tab note · ctrl+e · esc no",
-    };
-    let mut lines = vec![
-        Line::from(head),
-        Line::from(vec![
-            action_span("1", "Yes", 0, approval_sel, theme),
-            Span::raw(" "),
-            action_span("2", "Yes, always (chat)", 1, approval_sel, theme),
-            Span::raw(" "),
-            action_span("3", "No", 2, approval_sel, theme),
-        ]),
-        Line::from(vec![Span::styled(
-            hint,
-            Style::default().fg(theme.placeholder),
-        )]),
-        Line::from(vec![Span::styled(
-            req.reason.clone(),
-            Style::default().fg(theme.accent),
-        )]),
-    ];
-    if full {
-        if diff {
-            // Proposed patch replaces the generic kind/args lines: the
-            // header carries tool + path + counts, body rows tint +/-.
-            lines.extend(patch_lines);
-        } else {
-            lines.push(Line::from(vec![Span::styled(
-                format!(
-                    "# {}",
-                    match req.tool_name.as_str() {
-                        "bash" => "Shell command",
-                        "write" | "edit" => "File change",
-                        _ => "Tool request",
-                    }
-                ),
-                Style::default().fg(theme.code_fg),
-            )]));
-            lines.push(Line::from(vec![Span::styled(
-                arg_line,
-                Style::default().fg(theme.code_fg),
-            )]));
-        }
-    }
-    if comment_open {
-        lines.push(Line::from(vec![
-            Span::styled("note: ", Style::default().fg(theme.accent)),
-            Span::raw(format!("{comment}█")),
-        ]));
-        lines.push(Line::from(vec![Span::styled(
-            "enter sends · esc shuts",
-            Style::default().fg(theme.placeholder),
-        )]));
-    }
-    if explain {
-        let (level, why) = crate::permissions::PermissionHook::risk(&req.tool_name, &req.reason);
-        let lvl_color = match level {
-            "Low" => theme.add_fg,
-            "Med" => theme.accent,
-            _ => theme.del_fg,
-        };
-        lines.push(Line::from(vec![
-            Span::styled("risk: ", Style::default().fg(theme.placeholder)),
-            Span::styled(
-                level.to_string(),
-                Style::default().fg(lvl_color).add_modifier(Modifier::BOLD),
-            ),
-        ]));
-        for (i, part) in why
-            .chars()
-            .collect::<Vec<_>>()
-            .chunks(inner.width.max(1) as usize)
-            .enumerate()
-        {
-            if i >= 2 {
-                break;
-            }
-            let s: String = part.iter().collect();
-            lines.push(Line::from(vec![Span::styled(
-                s,
-                Style::default().fg(theme.code_fg),
-            )]));
-        }
-    }
-    lines.truncate(inner.height as usize);
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-}
-
-fn action_span(
-    num: &str,
-    label: &str,
-    index: usize,
-    selected: usize,
-    theme: &Theme,
-) -> Span<'static> {
-    match index == selected {
-        true => Span::styled(
-            format!("[{num}] {label}"),
-            Style::default()
-                .fg(theme.pane_bg)
-                .bg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        false => Span::styled(
-            format!(" {num}  {label} "),
-            Style::default().fg(theme.placeholder),
-        ),
-    }
 }
 
 fn picker_project_root() -> String {
@@ -4167,25 +3671,10 @@ fn render_gap(f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     f.render_widget(Paragraph::new(Line::from("")), area);
 }
 
-/// Busy/approval status row above the input band (terminal background).
+/// Busy status row above the input band (terminal background).
 /// Idle frames give it zero height, so it costs no rows when quiet.
 fn render_status(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     if area.height == 0 {
-        return;
-    }
-    if !app.pending_approvals.is_empty() {
-        let line = Line::from(vec![
-            Span::styled("◌ ", Style::default().fg(app.theme.accent)),
-            Span::styled(
-                format!("waiting approval ({} queued)", app.pending_approvals.len()),
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::styled(
-                " · 1 yes · 2 always · 3 no",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]);
-        f.render_widget(Paragraph::new(line), area);
         return;
     }
     if app.busy {
@@ -4216,7 +3705,7 @@ fn render_status(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
 /// Same rows as old band, but in float box. Gray hint text included.
 fn render_menu_float(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let live = menu_live(&app.input, app.cursor, &app.skill_names, &app.model_names);
-    // Mode tag: skill rows render like theme rows (`▸ <name>`).
+    // mode tag: skill rows render like theme rows (`▸ <name>`).
     let (mode, total) = match &live {
         MenuLive::Commands { cmds, .. } => ("cmds", cmds.len()),
         MenuLive::Themes { names, .. } => ("themes", names.len()),
@@ -4536,18 +4025,15 @@ fn render_at_menu(f: &mut ratatui::Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Aster-style footer: one left-aligned line — orange `▶▶▶ edit`, faint
-/// model, turn count, and key hints. Busy state lives in the status row
-/// above the input band, so the footer stays quiet during a turn.
+/// Aster-style footer: one left-aligned line — accent `▶ <model>` plus
+/// faint effort. Busy state lives in the status row above the input band,
+/// so the footer stays quiet during a turn.
 fn render_footer(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     let faint = Style::default().fg(Color::DarkGray);
+    let accent = Style::default().fg(app.theme.accent);
     let spans = vec![
         Span::raw("  "),
-        Span::styled(
-            app.mode.footer_text(),
-            Style::default().fg(app.theme.accent),
-        ),
-        Span::styled(format!("  ·  {}", app.model), faint),
+        Span::styled(format!("▶ {}", app.model), accent),
         Span::styled(format!("  ·  {}", app.effort), faint),
     ];
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -4902,10 +4388,9 @@ mod tests {
         let mid = cell_text(&buf, 3, 80);
         assert!(mid.contains('❯'), "prompt missing: {mid}");
         assert!(mid.contains("Message rem…"), "placeholder missing: {mid}");
-        // Footer: mode/model/effort line.
+        // Footer: model/effort line.
         let footer = cell_text(&buf, 5, 80);
-        assert!(footer.contains("▶ manual"), "footer missing: {footer}");
-        assert!(footer.contains("test-model"), "model missing: {footer}");
+        assert!(footer.contains("▶ test-model"), "footer missing: {footer}");
         assert!(footer.contains("medium"), "effort missing: {footer}");
         // Caret accounts for the 1-column inset + 2-column prompt.
         app.input = "hello".to_string();
@@ -4975,81 +4460,6 @@ mod tests {
         );
         let mid = cell_text(&buf, 3, 80);
         assert!(mid.contains("esc to interrupt"), "busy hint missing: {mid}");
-    }
-
-    #[test]
-    fn approval_sheet_renders_over_pane() {
-        let mut app = App::new("test-model".to_string(), "medium".to_string());
-        app.term_width = 80;
-        let (req, _rx) = approval_req("bash", "cargo test");
-        app.pending_approvals.push_back(req);
-        let buf = pane_buffer(&mut app, 80);
-        let text: String = (0..6)
-            .map(|y| cell_text(&buf, y, 80))
-            .collect::<Vec<_>>()
-            .join("\n");
-        // Small float box with border. In small pane, reason line drops
-        // (full text lives in chat rows); head + options + hint stay.
-        assert!(text.contains("Permission required"), "got: {text}");
-        assert!(text.contains("[1] Yes"), "got: {text}");
-        assert!(text.contains("3  No"), "got: {text}");
-        assert!(text.contains("┌"), "box border missing: {text}");
-        // Box rows carry the shaded background.
-        assert!(
-            (0..buf.area.height).any(|y| buf[(0, y)].bg == app.theme.pane_bg),
-            "popup box did not shade its area"
-        );
-    }
-
-    #[test]
-    fn frame_modal_keeps_compact_viewport_and_floats_box_over_pane() {
-        use ratatui::{Terminal, backend::TestBackend};
-        // Approval modals stay small and never grow the viewport; only the
-        // session picker expands (see viewport_height).
-        let mut app = App::new("test-model".to_string(), "medium".to_string());
-        assert_eq!(viewport_height(&app, 80, 24), app.pane_height(80));
-        let (req, _rx) = approval_req("bash", "cargo test");
-        app.pending_approvals.push_back(req);
-        assert_eq!(viewport_height(&app, 80, 24), app.pane_height(80));
-        let backend = TestBackend::new(80, app.pane_height(80));
-        let mut terminal = Terminal::new(backend).unwrap();
-        app.term_width = 80;
-        app.input = "hello".to_string();
-        app.cursor = 5;
-        terminal.draw(|f| render_frame(f, &mut app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let rows: Vec<String> = (0..buf.area.height)
-            .map(|y| cell_text(&buf, y, buf.area.width))
-            .collect();
-        let text = rows.join("\n");
-        // Small box content, float over pane. In small pane, reason
-        // line drops (full text in chat rows); head + options + hint stay.
-        assert!(text.contains("Permission required"), "got: {text}");
-        assert!(text.contains("[1] Yes"), "got: {text}");
-        assert!(text.contains("┌"), "box border missing: {text}");
-        // The modal covers the composer (it owns the keys) but the footer
-        // stays visible underneath.
-        assert!(text.contains("test-model"), "footer missing: {text}");
-        // Modal box sits above the footer; composer is covered by the box.
-        assert!(
-            !text.contains("\u{276f} hello"),
-            "composer must be covered: {text}"
-        );
-        // No fullscreen takeover: no cell carries the old rail_bg wash.
-        // (Row 0 is box fill here — the 5-row box covers the 6-row pane.)
-        assert!(
-            (0..buf.area.height).all(|y| buf[(0, y)].bg != app.theme.rail_bg),
-            "no rail_bg takeover allowed"
-        );
-        // Box interior keeps its fill for readability.
-        let box_row = rows
-            .iter()
-            .position(|l| l.contains("Permission required"))
-            .unwrap();
-        assert!(
-            (box_row as u16..buf.area.height).any(|y| buf[(0, y)].bg == app.theme.pane_bg),
-            "box must keep its shaded fill"
-        );
     }
 
     #[test]
@@ -5212,273 +4622,6 @@ mod tests {
         assert!(flat.contains("−1"), "got: {flat}");
     }
 
-    fn approval_req(
-        tool: &str,
-        preview: &str,
-    ) -> (
-        ApprovalRequest,
-        tokio::sync::oneshot::Receiver<ApprovalDecision>,
-    ) {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        let req = ApprovalRequest {
-            tool_name: tool.to_string(),
-            args_preview: preview.to_string(),
-            full_args: serde_json::json!({}),
-            reason: "needs approval".to_string(),
-            patch: None,
-            reply,
-        };
-        (req, rx)
-    }
-
-    /// Diff-accept variant: Mutate confirm carrying a proposed patch.
-    fn approval_req_patch(
-        tool: &str,
-        preview: &str,
-        patch: &str,
-    ) -> (
-        ApprovalRequest,
-        tokio::sync::oneshot::Receiver<ApprovalDecision>,
-    ) {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        let req = ApprovalRequest {
-            tool_name: tool.to_string(),
-            args_preview: preview.to_string(),
-            full_args: serde_json::json!({"path": "f.rs"}),
-            reason: "needs approval".to_string(),
-            patch: Some(patch.to_string()),
-            reply,
-        };
-        (req, rx)
-    }
-
-    #[test]
-    fn approval_modal_shows_proposed_patch_and_diff_hint() {
-        use ratatui::{Terminal, backend::TestBackend};
-        let mut app = App::new("test-model".to_string(), "medium".to_string());
-        app.term_width = 80;
-        let (req, _rx) = approval_req_patch("edit", "f.rs,1 edit(s)", "-old line\n+new line\n");
-        app.pending_approvals.push_back(req);
-        // Tall terminal: the modal takes its full layout (patch block
-        // only renders when there is room, like the kind/args lines).
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render_frame(f, &mut app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let text: String = (0..buf.area.height)
-            .map(|y| cell_text(&buf, y, buf.area.width))
-            .collect::<Vec<_>>()
-            .join("\n");
-        // Tinted patch body: removed then added line, with counts header.
-        assert!(text.contains("-old line"), "patch body missing: {text}");
-        assert!(text.contains("+new line"), "patch body missing: {text}");
-        assert!(text.contains("+1"), "patch counts missing: {text}");
-        // Spec hint: [a]ccept / [r]eject.
-        assert!(text.contains("a accept"), "got: {text}");
-        assert!(text.contains("r reject"), "got: {text}");
-    }
-
-    #[test]
-    fn approval_a_and_r_keys_accept_or_reject_the_patch() {
-        for (key, is) in [
-            (KeyCode::Char('a'), "approve"),
-            (KeyCode::Char('r'), "deny"),
-        ] {
-            let mut app = App::new("model".to_string(), "medium".to_string());
-            app.print_queue.clear();
-            let (req, rx) = approval_req_patch("edit", "f.rs", "-x\n+y\n");
-            app.pending_approvals.push_back(req);
-            let agent = std::sync::Arc::new(StubAgent);
-            let (tx, _rx) = mpsc::channel::<TurnResult>();
-            let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
-            assert!(!handle_key(
-                &mut app,
-                &agent,
-                &tx,
-                &think_tx,
-                key,
-                KeyModifiers::empty()
-            ));
-            assert!(app.pending_approvals.is_empty(), "{is}: modal must close");
-            let got = rx.blocking_recv().unwrap();
-            let ok = matches!(
-                (is, got),
-                ("approve", ApprovalDecision::Approve { .. })
-                    | ("deny", ApprovalDecision::Deny { .. })
-            );
-            assert!(ok, "wrong choice for {is}");
-        }
-    }
-
-    #[test]
-    fn modal_keys_resolve_approval_with_audit_notice() {
-        let mut app = App::new("model".to_string(), "medium".to_string());
-        app.print_queue.clear();
-        let (req, rx) = approval_req("bash", "cargo test");
-        app.pending_approvals.push_back(req);
-        // Number key 1 = Yes.
-        let agent = std::sync::Arc::new(StubAgent);
-        let (tx, _rx) = mpsc::channel::<TurnResult>();
-        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
-        assert!(!handle_key(
-            &mut app,
-            &agent,
-            &tx,
-            &think_tx,
-            KeyCode::Char('1'),
-            KeyModifiers::empty()
-        ));
-        assert!(app.pending_approvals.is_empty());
-        assert!(rx.blocking_recv().is_ok());
-        let flat: String = app
-            .print_queue
-            .iter()
-            .flatten()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(flat.contains("permission approved"), "got: {flat}");
-        assert!(flat.contains("cargo test"), "got: {flat}");
-    }
-
-    #[test]
-    fn modal_numbers_map_to_decisions() {
-        for (key, is) in [
-            (KeyCode::Char('1'), "approve"),
-            (KeyCode::Char('2'), "always"),
-            (KeyCode::Char('3'), "deny"),
-        ] {
-            let mut app = App::new("model".to_string(), "medium".to_string());
-            app.print_queue.clear();
-            let (req, rx) = approval_req("write", "a.txt");
-            app.pending_approvals.push_back(req);
-            let agent = std::sync::Arc::new(StubAgent);
-            let (tx, _rx) = mpsc::channel::<TurnResult>();
-            let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
-            assert!(!handle_key(
-                &mut app,
-                &agent,
-                &tx,
-                &think_tx,
-                key,
-                KeyModifiers::empty()
-            ));
-            let got = rx.blocking_recv().unwrap();
-            let ok = matches!(
-                (is, got),
-                ("approve", ApprovalDecision::Approve { .. })
-                    | ("always", ApprovalDecision::ApproveAlways { .. })
-                    | ("deny", ApprovalDecision::Deny { .. })
-            );
-            assert!(ok, "wrong choice for {is}");
-        }
-    }
-
-    #[test]
-    fn modal_esc_and_q_deny_and_turn_goes_on() {
-        for key in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('Q')] {
-            let mut app = App::new("model".to_string(), "medium".to_string());
-            app.print_queue.clear();
-            let (req, rx) = approval_req("bash", "cargo test");
-            app.pending_approvals.push_back(req);
-            let agent = std::sync::Arc::new(StubAgent);
-            let (tx, _rx) = mpsc::channel::<TurnResult>();
-            let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
-            assert!(!handle_key(
-                &mut app,
-                &agent,
-                &tx,
-                &think_tx,
-                key,
-                KeyModifiers::empty()
-            ));
-            assert!(matches!(
-                rx.blocking_recv().unwrap(),
-                ApprovalDecision::Deny { .. }
-            ));
-            assert!(app.pending_approvals.is_empty());
-        }
-    }
-
-    #[test]
-    fn modal_tab_note_sends_with_choice() {
-        let mut app = App::new("model".to_string(), "medium".to_string());
-        app.print_queue.clear();
-        let (req, rx) = approval_req("bash", "cargo test");
-        app.pending_approvals.push_back(req);
-        let agent = std::sync::Arc::new(StubAgent);
-        let (tx, _rx) = mpsc::channel::<TurnResult>();
-        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
-        // Tab opens note box. Type `hi`. Enter sends with Yes (sel 0).
-        assert!(!handle_key(
-            &mut app,
-            &agent,
-            &tx,
-            &think_tx,
-            KeyCode::Tab,
-            KeyModifiers::empty()
-        ));
-        assert!(app.approval_comment_open);
-        assert!(!handle_key(
-            &mut app,
-            &agent,
-            &tx,
-            &think_tx,
-            KeyCode::Char('h'),
-            KeyModifiers::empty()
-        ));
-        assert!(!handle_key(
-            &mut app,
-            &agent,
-            &tx,
-            &think_tx,
-            KeyCode::Char('i'),
-            KeyModifiers::empty()
-        ));
-        assert_eq!(app.approval_comment, "hi");
-        assert!(!handle_key(
-            &mut app,
-            &agent,
-            &tx,
-            &think_tx,
-            KeyCode::Enter,
-            KeyModifiers::empty()
-        ));
-        match rx.blocking_recv().unwrap() {
-            ApprovalDecision::Approve { comment } => assert_eq!(comment, "hi"),
-            other => panic!("wrong choice: {other:?}"),
-        }
-        assert!(app.pending_approvals.is_empty());
-        assert!(!app.approval_comment_open);
-        assert!(app.approval_comment.is_empty());
-    }
-
-    #[test]
-    fn modal_ctrl_e_toggles_risk_help() {
-        let mut app = App::new("model".to_string(), "medium".to_string());
-        let (req, _rx) = approval_req("bash", "cargo test");
-        app.pending_approvals.push_back(req);
-        let agent = std::sync::Arc::new(StubAgent);
-        let (tx, _rx) = mpsc::channel::<TurnResult>();
-        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
-        assert!(!app.approval_explain);
-        assert!(!handle_key(
-            &mut app,
-            &agent,
-            &tx,
-            &think_tx,
-            KeyCode::Char('e'),
-            KeyModifiers::CONTROL
-        ));
-        assert!(app.approval_explain);
-        assert!(!app.pending_approvals.is_empty());
-    }
-
     #[test]
     fn esc_while_busy_aborts_and_queues_interrupted_rows() {
         let mut app = App::new("model".to_string(), "medium".to_string());
@@ -5622,34 +4765,6 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_d_empty_modal_denies_then_quits() {
-        let mut app = App::new("model".to_string(), "medium".to_string());
-        app.print_queue.clear();
-        app.busy = true;
-        let (req, rx) = approval_req("bash", "cargo test");
-        app.pending_approvals.push_back(req);
-        let agent = std::sync::Arc::new(StubAgent);
-        let (tx, _rx) = mpsc::channel::<TurnResult>();
-        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
-        // Modal CONTROL exemption lets Ctrl+D through; head is denied
-        // (Skip, turn goes on), busy turn aborts, then quit.
-        assert!(handle_key(
-            &mut app,
-            &agent,
-            &tx,
-            &think_tx,
-            KeyCode::Char('d'),
-            KeyModifiers::CONTROL
-        ));
-        assert!(matches!(
-            rx.blocking_recv().unwrap(),
-            ApprovalDecision::Deny { .. }
-        ));
-        assert!(app.pending_approvals.is_empty());
-        assert!(!app.busy);
-    }
-
-    #[test]
     fn ctrl_c_idle_clears_input_without_quit() {
         let mut app = App::new("model".to_string(), "medium".to_string());
         app.input = "hello".to_string();
@@ -5717,37 +4832,6 @@ mod tests {
         ));
         assert!(app.busy);
         assert_eq!(app.turn_generation, 7);
-    }
-
-    #[test]
-    fn ctrl_c_in_modal_is_ignored() {
-        let mut app = App::new("model".to_string(), "medium".to_string());
-        app.print_queue.clear();
-        app.busy = true;
-        app.input = "typed".to_string();
-        app.cursor = 5;
-        let (req, mut rx) = approval_req("bash", "cargo test");
-        app.pending_approvals.push_back(req);
-        let agent = std::sync::Arc::new(StubAgent);
-        let (tx, _rx) = mpsc::channel::<TurnResult>();
-        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
-        // Modal CONTROL blanket-ignore: no clear, no resolve, no quit.
-        assert!(!handle_key(
-            &mut app,
-            &agent,
-            &tx,
-            &think_tx,
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL
-        ));
-        assert_eq!(app.input, "typed");
-        assert_eq!(app.cursor, 5);
-        assert_eq!(app.pending_approvals.len(), 1);
-        assert!(
-            rx.try_recv().is_err(),
-            "modal Ctrl+C must not resolve the approval"
-        );
-        assert!(app.busy);
     }
 
     static SESSION_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -8365,26 +7449,6 @@ mod tests {
         app.input = "@src/main.rs".to_string();
         app.cursor = app.input.chars().count();
         assert_eq!(at_row_count(&app), 0, "@-menu suppressed when busy");
-    }
-
-    #[test]
-    fn at_menu_suppressed_when_pending_approval() {
-        let mut app = App::new("model".to_string(), "medium".to_string());
-        app.print_queue.clear();
-        app.input = "@src/main.rs".to_string();
-        app.cursor = app.input.chars().count();
-        // Manually inject a fake approval
-        let (tx, _rx) = tokio::sync::oneshot::channel();
-        app.pending_approvals
-            .push_back(crate::permissions::ApprovalRequest {
-                tool_name: "test".to_string(),
-                args_preview: "()".to_string(),
-                full_args: serde_json::Value::Null,
-                reason: "test".to_string(),
-                patch: None,
-                reply: tx,
-            });
-        assert_eq!(at_row_count(&app), 0, "@-menu suppressed during approval");
     }
 
     #[test]

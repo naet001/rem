@@ -316,7 +316,6 @@ pub fn preamble_section(inventory: &[ServerInventory]) -> String {
     }
     let mut out = String::from(
         "\n\nAvailable MCP tools (server — mcp__server__tool — description). \
-         These are third-party tools; every call asks for approval. \
          Prefer reading relevant files first, then call the MCP tool:\n",
     );
     for server in inventory {

@@ -384,7 +384,7 @@ impl<R: TaskChildRunner + 'static> Tool for TaskTool<R> {
     type Error = ToolError;
 
     fn description(&self) -> String {
-        "Spawn scoped subagent(s) and wait for the merged result. Single: description (short label) + prompt (full task). Fan-out: tasks[] array (up to 8, 4 run at a time) merged as ## sections in input order, per-child errors kept inline. background:true detaches the whole call and returns an id immediately; the summary arrives attached to a later turn (/tasks shows status). Children get fresh context, the same file/shell/git/search/web tools plus todowrite (never task: no recursion), and share the approval channel.".to_string()
+        "Spawn scoped subagent(s) and wait for the merged result. Single: description (short label) + prompt (full task). Fan-out: tasks[] array (up to 8, 4 run at a time) merged as ## sections in input order, per-child errors kept inline. background:true detaches the whole call and returns an id immediately; the summary arrives attached to a later turn (/tasks shows status). Children get fresh context, the same file/shell/git/search/web tools plus todowrite (never task: no recursion).".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {

@@ -374,53 +374,6 @@ fn diff_lines(body: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Approval request rows, printed into scrollback when the modal takes over
-/// the keys. The pane underneath keeps running the status spinner.
-pub(crate) fn approval_rows(
-    tool_name: &str,
-    args_preview: &str,
-    reason: &str,
-    queued: usize,
-    width: usize,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
-    let mut head: Vec<Span<'static>> = vec![
-        Span::styled("◌ ", Style::default().fg(theme.accent)),
-        Span::styled(
-            "permission — approval needed".to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if queued > 1 {
-        head.push(Span::styled(
-            format!(" (1 of {queued})"),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    let lines = vec![
-        Line::from(head),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                format!("{tool_name} ({args_preview})"),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(reason.to_string(), dim()),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                "y approve · a always · n deny · x abort",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-    ];
-    prepend_blank(hang(lines, Span::raw(""), width))
-}
-
 enum Elided<'a> {
     Text(&'a str),
     Gap(usize),
