@@ -17,7 +17,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph, Widget, Wrap},
+    widgets::{Paragraph, Widget, Wrap},
 };
 use tokio::task::JoinHandle;
 use unicode_width::UnicodeWidthStr;
@@ -1162,7 +1162,7 @@ fn read_at_dir(path: &std::path::Path, display: &str) -> Result<String, String> 
 /// Expand all `@` refs in `text` into fenced content blocks appended after
 /// the original text. On any bad ref, returns `Err` naming the first bad ref.
 /// Root confinement: resolved against `project_root`.
-fn expand_at_refs(text: &str, project_root: &std::path::Path) -> Result<String, String> {
+pub(crate) fn expand_at_refs(text: &str, project_root: &std::path::Path) -> Result<String, String> {
     let refs = scan_at_refs(text);
     if refs.is_empty() {
         return Ok(text.to_string());
@@ -2616,7 +2616,7 @@ fn handle_theme_command(app: &mut App, arg: &str) {
 /// `SKILL.md` bodies with `$ARGUMENTS` substitution. Returns `None` when the
 /// input is not a skill invoke. `Err` names the first unknown skill.
 /// The display short form is the original text (transcript shows `/skill:x`).
-fn expand_skill_invokes(
+pub(crate) fn expand_skill_invokes(
     text: &str,
     agent: &Arc<impl AgentLoop + Send + Sync + 'static>,
 ) -> Result<Option<(String, String)>, String> {
@@ -3234,9 +3234,12 @@ impl App {
         PANE_ROWS.saturating_add(self.visible_input_lines(term_width).saturating_sub(1) as u16)
     }
 
-    fn input_band_height(&self, term_width: u16, menu_open: bool) -> u16 {
+    fn input_band_height(&self, term_width: u16, _menu_open: bool) -> u16 {
+        // Ruled composer: 1 top bar + visible text lines + 1 bottom bar.
+        // Both bars are always present so the input zone reads as a framed
+        // band; the float menu never steals layout rows.
         let lines = self.visible_input_lines(term_width) as u16;
-        lines + u16::from(!(menu_open && lines == 1)) + 1
+        lines + 2
     }
 
     fn sync_input_scroll(&mut self, max_width: usize) {
@@ -3347,26 +3350,32 @@ fn insert_newline(app: &mut App) {
     clamp_menu_sel(app);
 }
 
-fn render_overflow_line(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    show_up: bool,
-    show_down: bool,
-    theme: &Theme,
-) {
-    if !show_up && !show_down {
+/// Full-width accent rule framing the composer (top + bottom bars).
+/// When `label` is set (overflow cue), it opens the rule like
+/// `── ↑ more above ───…` so the bar stays readable as a bar.
+fn render_rule(f: &mut ratatui::Frame, area: Rect, theme: &Theme, label: Option<&str>) {
+    if area.height == 0 || area.width == 0 {
         return;
     }
-    let left = if show_up { "  ↑ more above" } else { "" };
-    let right = if show_down { "↓ more below  " } else { "" };
-    let used = UnicodeWidthStr::width(left) + UnicodeWidthStr::width(right);
-    let spaces = (area.width as usize).saturating_sub(used);
-    let line = Line::from(vec![
-        Span::styled(left, Style::default().fg(theme.accent)),
-        Span::raw(" ".repeat(spaces)),
-        Span::styled(right, Style::default().fg(theme.accent)),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+    let w = area.width as usize;
+    let line = match label {
+        None => Line::from(Span::styled(
+            "─".repeat(w),
+            Style::default().fg(theme.accent),
+        )),
+        Some(text) => {
+            let head = format!("── {text} ");
+            let fill = "─".repeat(w.saturating_sub(UnicodeWidthStr::width(head.as_str())));
+            Line::from(vec![
+                Span::styled(head, Style::default().fg(theme.accent)),
+                Span::styled(fill, Style::default().fg(theme.accent)),
+            ])
+        }
+    };
+    f.render_widget(
+        Paragraph::new(line),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
 }
 
 fn cursor_position(app: &App, area: Rect) -> Position {
@@ -3375,7 +3384,10 @@ fn cursor_position(app: &App, area: Rect) -> Position {
     let visible = layout.rows.len().min(app.max_visible_input_lines).max(1);
     let cursor = app.cursor.min(layout.positions.len() - 1);
     let (row, column) = layout.positions[cursor];
-    let top_padding = area.height.saturating_sub(visible as u16).saturating_div(2);
+    // Text sits one row below the top rule (+ centering pad when
+    // the area is taller than the framed block).
+    let need = visible as u16 + 2;
+    let top_pad = area.height.saturating_sub(need) / 2;
     let visible_row = row.saturating_sub(app.input_scroll);
     Position::new(
         area.x
@@ -3383,39 +3395,44 @@ fn cursor_position(app: &App, area: Rect) -> Position {
             .saturating_add(column.min(max_width) as u16)
             .min(area.right().saturating_sub(1)),
         area.y
-            .saturating_add(top_padding)
+            .saturating_add(top_pad)
+            .saturating_add(1)
             .saturating_add(visible_row as u16)
             .min(area.bottom().saturating_sub(1)),
     )
 }
 
 fn render_input(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    f.render_widget(
-        Block::default().style(Style::default().bg(app.theme.pane_bg)),
-        area,
-    );
+    // Ruled composer: terminal background, no block fill. An accent bar
+    // above and below the text rows marks the input zone; the `❯` prompt
+    // and footer carry the remaining wayfinding.
     if area.height == 0 || area.width < 8 {
         return;
     }
     let max_width = (area.width as usize).saturating_sub(4).max(1);
     let layout = input_layout(&app.input, max_width);
     let visible = layout.rows.len().min(app.max_visible_input_lines).max(1);
-    let top_padding = area.height.saturating_sub(visible as u16) / 2;
-    let bottom_padding = area.height.saturating_sub(visible as u16 + top_padding);
     let show_up = app.input_scroll > 0;
     let show_down = app.input_scroll + visible < layout.rows.len();
+    // Center the framed block when the area is taller than needed.
+    let need = visible as u16 + 2;
+    let top_pad = area.height.saturating_sub(need) / 2;
+    let bar_top = area.y + top_pad;
+    let text_top = bar_top + 1;
+    let bar_bottom = text_top + visible as u16;
 
-    if top_padding > 0 {
-        render_overflow_line(
-            f,
-            Rect::new(area.x, area.y, area.width, 1),
-            show_up,
-            show_down && bottom_padding == 0,
-            &app.theme,
-        );
-    }
+    render_rule(
+        f,
+        Rect::new(area.x, bar_top, area.width, 1),
+        &app.theme,
+        show_up.then_some("↑ more above"),
+    );
     let first = app.input_scroll.min(layout.rows.len().saturating_sub(1));
     for (offset, text) in layout.rows.iter().skip(first).take(visible).enumerate() {
+        let y = text_top + offset as u16;
+        if y >= bar_bottom || y >= area.bottom() {
+            break;
+        }
         let prompt = first + offset == 0;
         let prefix = if prompt { " " } else { "   " };
         let mut body = vec![Span::raw(prefix)];
@@ -3443,19 +3460,17 @@ fn render_input(f: &mut ratatui::Frame, app: &App, area: Rect) {
             body.push(Span::raw(text.clone()));
             body
         };
-        let y = area.y + top_padding + offset as u16;
         f.render_widget(
             Paragraph::new(Line::from(body)),
             Rect::new(area.x, y, area.width, 1),
         );
     }
-    if bottom_padding > 0 {
-        render_overflow_line(
+    if bar_bottom < area.bottom() {
+        render_rule(
             f,
-            Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
-            show_up && top_padding == 0,
-            show_down,
+            Rect::new(area.x, bar_bottom, area.width, 1),
             &app.theme,
+            show_down.then_some("↓ more below"),
         );
     }
 }
@@ -3497,7 +3512,7 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
         .constraints([
             Constraint::Length(1),        // gap (terminal bg)
             Constraint::Length(status_h), // status (busy/approval/idle)
-            Constraint::Length(input_h),  // shaded input band
+            Constraint::Length(input_h),  // ruled composer (bars + text)
             Constraint::Length(1),        // footer
         ])
         .split(pane_area);
@@ -4615,20 +4630,35 @@ mod tests {
         assert_eq!(buf[(0, 0)].bg, ratatui::style::Color::Reset);
         // Status row idle: blank line, terminal background.
         assert_eq!(cell_text(&buf, 1, 80).trim(), "");
-        // Input band rows: shaded.
-        for y in 2..5 {
-            assert_eq!(buf[(0, y)].bg, app.theme.pane_bg, "band row {y}");
+        // Ruled composer: accent bars frame the text row, no block fill.
+        for y in [2u16, 4u16] {
+            assert_eq!(buf[(0, y)].fg, app.theme.accent, "rule row {y}");
+            assert!(
+                cell_text(&buf, y, 80).chars().all(|c| c == '─'),
+                "rule row {y} must be a full-width bar"
+            );
+            assert_eq!(
+                buf[(0, y)].bg,
+                ratatui::style::Color::Reset,
+                "rule row {y} keeps terminal bg"
+            );
         }
-        // Prompt + placeholder on the band's middle row.
+        // Prompt + placeholder on the framed text row.
         let mid = cell_text(&buf, 3, 80);
         assert!(mid.contains('❯'), "prompt missing: {mid}");
         assert!(mid.contains("Message rem…"), "placeholder missing: {mid}");
+        assert_eq!(
+            buf[(0, 3)].bg,
+            ratatui::style::Color::Reset,
+            "text row keeps terminal bg"
+        );
         // Footer: mode/model/effort line.
         let footer = cell_text(&buf, 5, 80);
         assert!(footer.contains("▶ manual"), "footer missing: {footer}");
         assert!(footer.contains("test-model"), "model missing: {footer}");
         assert!(footer.contains("medium"), "effort missing: {footer}");
-        // Caret accounts for the 1-column inset + 2-column prompt.
+        // Caret accounts for the 1-column inset + 2-column prompt,
+        // one row down for the top rule.
         app.input = "hello".to_string();
         app.cursor = 5;
         let position = cursor_position(&app, Rect::new(0, 2, 80, 3));
@@ -4715,9 +4745,16 @@ mod tests {
         assert!(text.contains("[1] Yes"), "got: {text}");
         assert!(text.contains("3  No"), "got: {text}");
         assert!(text.contains("┌"), "box border missing: {text}");
-        // Box rows carry the shaded background.
+        // Box rows carry the shaded background. The ruled composer no
+        // longer fills the pane, so check the box's own interior rows
+        // (first box row .. last rule bar), not column-0 pass-through.
+        let box_top = text
+            .find("Permission required")
+            .map(|b| b / 80)
+            .unwrap_or(0) as u16;
         assert!(
-            (0..buf.area.height).any(|y| buf[(0, y)].bg == app.theme.pane_bg),
+            (box_top..buf.area.height)
+                .any(|y| (1..buf.area.width).any(|x| buf[(x, y)].bg == app.theme.pane_bg)),
             "popup box did not shade its area"
         );
     }
@@ -4762,13 +4799,16 @@ mod tests {
             (0..buf.area.height).all(|y| buf[(0, y)].bg != app.theme.rail_bg),
             "no rail_bg takeover allowed"
         );
-        // Box interior keeps its fill for readability.
+        // Box interior keeps its fill for readability. Column 0 can no
+        // longer pass through the old band fill (the ruled composer has
+        // terminal bg), so check the box interior columns instead.
         let box_row = rows
             .iter()
             .position(|l| l.contains("Permission required"))
             .unwrap();
         assert!(
-            (box_row as u16..buf.area.height).any(|y| buf[(0, y)].bg == app.theme.pane_bg),
+            (box_row as u16..buf.area.height)
+                .any(|y| (1..buf.area.width).any(|x| buf[(x, y)].bg == app.theme.pane_bg)),
             "box must keep its shaded fill"
         );
     }

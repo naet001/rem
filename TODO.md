@@ -13,13 +13,13 @@ Legend: `[ ]` todo, `[/]` in-progress branch, `[x]` done.
 - [x] Merge `feat/skills` cleanly into `dev`
 - [x] Add license (MIT/Apache-2.0), flesh out README + `--help`
 
-### 2. Headless / automation interfaces (TUI-only today)
-- [ ] `rem -p "<prompt>"` print mode (pipe final response to stdout)
-- [ ] `rem exec "<prompt>"` non-interactive run, non-zero exit on error
-- [ ] `--output json|jsonl` event stream (turns, tool calls/results, errors)
-- [ ] Stdin pipe support (`echo ... | rem -p`)
-- [ ] `--yolo` / `--plan` / `--mode <name>` flags for headless runs
-- [ ] `--resume <id>` works headless; fail-open policy flag (`--approve` / `--deny` default)
+### 2. Headless / automation interfaces (grilled 2026-10-06: `-p` only, no `exec`)
+- [x] `rem -p "<prompt>"` print mode (pipe final response to stdout; exit 0/1/2)
+- [x] ~~`rem exec`~~ dropped: one canonical `-p` path (bare positionals hint at `-p`)
+- [x] `--output text|json|jsonl` event stream (tools + result/error; text default)
+- [x] Stdin pipe support (`echo ... | rem -p`; stdin first + `-p` second, either alone)
+- [x] `--mode <name>` single flag only (no `--yolo`/`--plan` shorthands; default `manual`)
+- [x] `--resume <id>` works headless; deny-by-default + `--allow-all` (Confirm→Approve, Deny floor holds)
 
 ### 3. MCP client (`feat/mcp` exists, not landed)
 - [ ] Land `feat/mcp`: MCP client (stdio + SSE/http)
