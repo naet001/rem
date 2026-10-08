@@ -276,6 +276,52 @@ fn resize_pane_viewport<B: Backend>(
     )?;
     Ok(())
 }
+/// Repaint-safe viewport fixup after a size change: re-anchor the inline
+/// viewport, then reset ratatui's diff baseline so the next draw repaints
+/// every viewport cell (not just the diff).
+fn redraw_viewport_for_size<B: Backend>(
+    terminal: &mut Terminal<B>,
+    backend: impl FnOnce() -> B,
+    width: u16,
+    height: u16,
+    pane_height: u16,
+) -> io::Result<()> {
+    resize_pane_viewport(terminal, backend, width, height, pane_height)?;
+    terminal.clear()?;
+    Ok(())
+}
+
+/// Full visible-screen reset after a terminal resize (production path).
+/// `ClearType::All` wipes stale emulator-reflowed rows from view without
+/// purging scrollback transcript; the viewport re-anchors at the bottom
+/// and the diff baseline resets so everything repaints on next draw.
+fn full_clear_and_reanchor(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &App,
+    width: u16,
+    height: u16,
+) -> anyhow::Result<()> {
+    let pane_height = viewport_height(app, width, height);
+    use crossterm::{
+        cursor::MoveTo,
+        execute,
+        terminal::{Clear, ClearType},
+    };
+    execute!(
+        io::stdout(),
+        Clear(ClearType::All),
+        MoveTo(0, height.saturating_sub(pane_height)),
+    )?;
+    redraw_viewport_for_size(
+        terminal,
+        || CrosstermBackend::new(io::stdout()),
+        width,
+        height,
+        pane_height,
+    )
+    .context("resize composer viewport")?;
+    Ok(())
+}
 
 /// Braille spinner frames for the busy status row (same set Aster uses).
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1589,6 +1635,9 @@ struct App {
     turn_generation: u64,
     /// Last terminal width seen; row groups wrap to this at drain time.
     term_width: u16,
+    /// Last terminal height seen; paired with `term_width` so a resize is
+    /// detected (emulator reflow leaves stale wrapped rows otherwise).
+    term_height: u16,
     /// Freeze transcript drain for one frame after a terminal resize so
     /// queued rows cannot race viewport repositioning.
     skip_drain_once: bool,
@@ -1744,6 +1793,7 @@ impl App {
             current_watcher: None,
             turn_generation: 0,
             term_width: 80,
+            term_height: 24,
             request_clear_screen: false,
             skip_drain_once: false,
         };
@@ -1948,11 +1998,14 @@ fn event_loop(
     think_tx: mpsc::Sender<ThinkMsg>,
     approval_rx: &mut ApprovalRx,
 ) -> anyhow::Result<()> {
-    // Track the viewport width so row groups wrap correctly; refreshed
-    // every frame from the terminal size. Stores the REAL width for
-    // wrapping; any layout floor stays at the render site, never written
-    // back here (Phase 2/3).
-    app.term_width = terminal.size().map(|s| s.width).unwrap_or(80).max(1);
+    // Track the terminal size so row groups wrap correctly; refreshed every
+    // frame from the terminal size. Stores the REAL dimensions for wrapping;
+    // any layout floor stays at the render site, never written back here.
+    let size = terminal
+        .size()
+        .unwrap_or(ratatui::layout::Size::new(80, 24));
+    app.term_width = size.width.max(1);
+    app.term_height = size.height.max(1);
     // Seed transcript: welcome notice prints above the pane on first frame.
     app.dirty = true;
     loop {
@@ -2033,24 +2086,25 @@ fn event_loop(
         // Print queued transcript groups above the viewport first, so the
         // pane draw below never overlaps them.
         drain_print_queue(terminal, app).context("print transcript")?;
-
         if app.dirty || app.busy || !app.pending_approvals.is_empty() {
-            // Refresh width: a resize between frames re-wraps future rows.
-            // Already-queued groups wrapped at enqueue width; rows are
-            // short-lived (one frame) so drift is bounded to a frame.
-            // Store the real width (no `.max(20)` lie); any layout floor
-            // stays local to the render site, never written back here.
+            // Refresh size: a resize between frames reflows every drawn row
+            // (the emulator owns scrollback; ratatui cannot repaint it), so
+            // on change full-clear the visible screen, re-anchor the
+            // viewport, and redraw — a plain diff leaves stale wrapped rows.
             if let Ok(size) = terminal.size() {
-                app.term_width = size.width.max(1);
-                app.set_available_height(size.height);
-                resize_pane_viewport(
-                    terminal,
-                    || CrosstermBackend::new(io::stdout()),
-                    size.width,
-                    size.height,
-                    viewport_height(app, size.width, size.height),
-                )
-                .context("resize composer viewport")?;
+                if app.apply_size(size.width, size.height) {
+                    app.skip_drain_once = true;
+                    full_clear_and_reanchor(terminal, app, size.width, size.height)?;
+                } else {
+                    resize_pane_viewport(
+                        terminal,
+                        || CrosstermBackend::new(io::stdout()),
+                        size.width,
+                        size.height,
+                        viewport_height(app, size.width, size.height),
+                    )
+                    .context("resize composer viewport")?;
+                }
             }
             terminal
                 .draw(|f| render_frame(f, app))
@@ -2069,17 +2123,10 @@ fn event_loop(
                 // No mouse handling (ADR-0005): the transcript is terminal
                 // scrollback, so the terminal keeps selection and copy.
                 Event::Resize(w, h) => {
-                    // Use event dimensions directly and redraw immediately.
-                    app.term_width = w.max(1);
-                    app.set_available_height(h);
-                    resize_pane_viewport(
-                        terminal,
-                        || CrosstermBackend::new(io::stdout()),
-                        w,
-                        h,
-                        viewport_height(app, w, h),
-                    )
-                    .context("resize composer viewport")?;
+                    // Resize event: use dimensions directly, full-clear the
+                    // visible screen (scrollback kept), re-anchor, redraw.
+                    app.apply_size(w, h);
+                    full_clear_and_reanchor(terminal, app, w.max(1), h.max(1))?;
                     // Freeze transcript insertion for one frame after resize.
                     app.skip_drain_once = true;
                     terminal
@@ -3257,6 +3304,19 @@ impl App {
             .saturating_sub(PANE_ROWS - 1)
             .clamp(1, MAX_INPUT_LINES as u16) as usize;
     }
+    /// Record a new terminal size; returns true when it changed. A change
+    /// means the emulator reflowed every drawn row, so the caller must
+    /// full-clear the visible screen, re-anchor the viewport, and redraw —
+    /// a plain diff repaint leaves stale wrapped rows above the pane.
+    fn apply_size(&mut self, width: u16, height: u16) -> bool {
+        let width = width.max(1);
+        let height = height.max(1);
+        let changed = (self.term_width, self.term_height) != (width, height);
+        self.term_width = width;
+        self.term_height = height;
+        self.set_available_height(height);
+        changed
+    }
 
     fn visible_input_lines(&self, term_width: u16) -> usize {
         input_layout(&self.input, (term_width as usize).saturating_sub(4))
@@ -4236,6 +4296,70 @@ fn render_footer(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn apply_size_reports_change_and_tracks_dimensions() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        // Constructor seeds 80x24.
+        assert!(!app.apply_size(80, 24));
+        assert!(app.apply_size(60, 24));
+        assert_eq!((app.term_width, app.term_height), (60, 24));
+        assert!(!app.apply_size(60, 24));
+        assert!(app.apply_size(60, 32));
+        assert_eq!((app.term_width, app.term_height), (60, 32));
+    }
+
+    #[test]
+    fn resize_redraw_clears_stale_rows_and_repaints_viewport() {
+        use ratatui::{Terminal, TerminalOptions, Viewport, backend::TestBackend};
+        // Emulate the ghost-rule repro: full-width composer at 80 cols,
+        // then shrink to 60. The redraw path must leave no wide-rule
+        // residue and repaint every viewport cell.
+        let make_terminal = |w: u16, h: u16| {
+            let backend = TestBackend::new(w, h);
+            Terminal::with_options(
+                backend,
+                TerminalOptions {
+                    viewport: Viewport::Inline(PANE_ROWS),
+                },
+            )
+            .unwrap()
+        };
+        let mut terminal = make_terminal(80, 24);
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.apply_size(80, 24);
+        terminal.draw(|f| render_pane(f, &mut app)).unwrap();
+        let wide_rule: String = "─".repeat(80);
+        let wide: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(wide.contains(&wide_rule), "wide rule missing pre-shrink");
+        // Shrink: re-anchor + reset the diff baseline, then redraw — the
+        // same two calls the resize handlers make.
+        assert!(app.apply_size(60, 24));
+        redraw_viewport_for_size(
+            &mut terminal,
+            || TestBackend::new(60, 24),
+            60,
+            24,
+            viewport_height(&app, 60, 24),
+        )
+        .unwrap();
+        terminal.draw(|f| render_pane(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content.iter().map(|c| c.symbol().to_string()).collect();
+        assert!(
+            !text.contains(&wide_rule),
+            "stale wide rule survived shrink: {text}"
+        );
+        let rule60: String = "─".repeat(60);
+        assert!(text.contains(&rule60), "narrow rule missing: {text}");
+        let area = terminal.get_frame().area();
+        assert_eq!(area, Rect::new(0, 24 - area.height, 60, area.height));
+    }
 
     #[test]
     fn pane_stays_bottom_anchored_across_terminal_resizes() {
