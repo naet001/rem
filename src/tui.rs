@@ -384,6 +384,12 @@ static COMMANDS: &[Command] = &[
         desc: "show local context usage",
         hint: "",
     },
+    Command {
+        name: "mcp",
+        takes_arg: true,
+        desc: "list, toggle, or log in MCP servers",
+        hint: "[on|off|login|logout <name>]",
+    },
 ];
 
 /// Fixed instruction for `/init` (ADR-0009): runs as a normal agent turn so
@@ -3064,6 +3070,90 @@ fn submit(
                 ));
                 return false;
             }
+            "mcp" => {
+                let arg = arg.trim();
+                // Login/logout form: `/mcp login <name>` / `/mcp logout <name>`.
+                // Toggle form: `/mcp on <name>` / `/mcp off <name>`.
+                let mut words = arg.split_whitespace();
+                match (words.next(), words.next(), words.next()) {
+                    (Some("login"), Some(name), None) => {
+                        match agent.mcp_login(name) {
+                            Ok(url) => app.enqueue_notice(format!(
+                                "mcp: open this URL to log in {name}:\n{url}"
+                            )),
+                            Err(e) => app.enqueue_notice(format!("mcp: {e}")),
+                        }
+                        return false;
+                    }
+                    (Some("logout"), Some(name), None) => {
+                        match agent.mcp_logout(name) {
+                            Ok(msg) => app.enqueue_notice(format!("mcp: {msg}")),
+                            Err(e) => app.enqueue_notice(format!("mcp: {e}")),
+                        }
+                        return false;
+                    }
+                    (Some("on"), Some(name), None) => {
+                        // Busy turns serialize at submit: unreachable while
+                        // busy, so no busy branch here (mirrors skills list).
+                        match agent.set_mcp_server_enabled(name, true) {
+                            Ok(msg) => app.enqueue_notice(format!("mcp: {msg}")),
+                            Err(e) => app.enqueue_notice(format!("mcp: {e}")),
+                        }
+                        return false;
+                    }
+                    (Some("off"), Some(name), None) => {
+                        // Busy turns serialize at submit (see above).
+                        match agent.set_mcp_server_enabled(name, false) {
+                            Ok(msg) => app.enqueue_notice(format!("mcp: {msg}")),
+                            Err(e) => app.enqueue_notice(format!("mcp: {e}")),
+                        }
+                        return false;
+                    }
+                    (Some(_), _, _) => {
+                        app.enqueue_notice(
+                            "usage: /mcp [on <name> | off <name> | login <name> | logout <name>]"
+                                .to_string(),
+                        );
+                        return false;
+                    }
+                    // Bare `/mcp`: fall through to the listing below.
+                    (None, None, None) => {}
+                    _ => {}
+                }
+                let list = agent.list_mcp_servers();
+                if list.is_empty() {
+                    app.enqueue_notice(
+                        "no MCP servers configured (see ~/.config/rem/mcp.json)".to_string(),
+                    );
+                } else {
+                    let mut msg = String::from("mcp servers:");
+                    for s in list {
+                        let (state, extra) = match &s.status {
+                            crate::agent::McpServerStatus::Connected => {
+                                ("connected", String::new())
+                            }
+                            crate::agent::McpServerStatus::Failed { reason } => {
+                                ("failed", format!(" — {reason}"))
+                            }
+                            crate::agent::McpServerStatus::NeedsAuth => {
+                                ("needs-auth", " — run /mcp login <name>".to_string())
+                            }
+                        };
+                        let enabled = match s.enabled {
+                            true => "",
+                            false => " [disabled]",
+                        };
+                        msg.push_str(&format!(
+                            "\n  {} — {state} ({} tool{}){extra}{enabled}",
+                            s.name,
+                            s.tool_count,
+                            if s.tool_count == 1 { "" } else { "s" },
+                        ));
+                    }
+                    app.enqueue_notice(msg);
+                }
+                return false;
+            }
             _ => {}
         }
     }
@@ -5639,9 +5729,9 @@ mod tests {
         app.cursor = 1;
         app.menu_sel = Some(0);
         app.history = vec!["old turn".to_string()];
-        // 12 registry commands: quit, new, help, theme, init, resume,
-        // rename, fork, skills, model, effort, context.
-        for expect in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0] {
+        // 13 registry commands: quit, new, help, theme, init, resume,
+        // rename, fork, skills, model, effort, context, mcp.
+        for expect in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0] {
             assert!(!handle_key(
                 &mut app,
                 &agent,
@@ -5660,7 +5750,7 @@ mod tests {
             KeyCode::Up,
             KeyModifiers::empty()
         ));
-        assert_eq!(app.menu_sel, Some(11));
+        assert_eq!(app.menu_sel, Some(12));
         assert_eq!(app.hist_idx, None);
         assert_eq!(app.input, "/");
         assert_eq!(app.history, vec!["old turn".to_string()]);
@@ -5678,6 +5768,222 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Stub with two MCP servers (one connected, one failed) for
+    /// `/mcp` panel tests.
+    struct McpStubAgent;
+
+    #[async_trait::async_trait]
+    impl AgentLoop for McpStubAgent {
+        async fn chat(&self, _prompt: &str) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn list_mcp_servers(&self) -> Vec<crate::agent::McpServerSummary> {
+            vec![
+                crate::agent::McpServerSummary {
+                    name: "py".to_string(),
+                    status: crate::agent::McpServerStatus::Connected,
+                    tool_count: 2,
+                    enabled: true,
+                },
+                crate::agent::McpServerSummary {
+                    name: "broken".to_string(),
+                    status: crate::agent::McpServerStatus::Failed {
+                        reason: "spawn failed".to_string(),
+                    },
+                    tool_count: 0,
+                    enabled: true,
+                },
+            ]
+        }
+    }
+
+    #[tokio::test]
+    async fn slash_mcp_lists_servers_without_turn() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(McpStubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/mcp".to_string();
+        app.cursor = 4;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy, "/mcp must not start a turn");
+        let flat = print_flat(&app);
+        assert!(flat.contains("py"), "got: {flat}");
+        assert!(flat.contains("connected"), "got: {flat}");
+        assert!(flat.contains("broken"), "got: {flat}");
+        // Reason may wrap mid-line in the scrollback renderer.
+        let squashed: String = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(squashed.contains("spawn failed"), "got: {flat}");
+    }
+
+    #[tokio::test]
+    async fn slash_mcp_off_toggles_without_turn() {
+        /// Stub recording toggle calls.
+        struct ToggleStubAgent;
+        static TOGGLES: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+        #[async_trait::async_trait]
+        impl AgentLoop for ToggleStubAgent {
+            async fn chat(&self, _prompt: &str) -> Result<String, String> {
+                Ok(String::new())
+            }
+            fn list_mcp_servers(&self) -> Vec<crate::agent::McpServerSummary> {
+                Vec::new()
+            }
+            fn set_mcp_server_enabled(&self, name: &str, enabled: bool) -> Result<String, String> {
+                TOGGLES.lock().unwrap().push((name.to_string(), enabled));
+                Ok(format!("mcp `{name}` toggled"))
+            }
+        }
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(ToggleStubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/mcp off py".to_string();
+        app.cursor = 11;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy, "/mcp off must not start a turn");
+        assert_eq!(
+            TOGGLES.lock().unwrap().as_slice(),
+            &[("py".to_string(), false)]
+        );
+        assert!(print_flat(&app).contains("toggled"));
+    }
+
+    #[tokio::test]
+    async fn slash_mcp_bad_arg_usage_no_turn() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(McpStubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/mcp frobnicate".to_string();
+        app.cursor = 16;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy);
+        assert!(
+            print_flat(&app)
+                .contains("usage: /mcp [on <name> | off <name> | login <name> | logout <name>]")
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_mcp_toggle_busy_ignored_no_turn() {
+        // Busy turns serialize: submit returns early with no notice and
+        // no toggle, mirroring `/skills reload` (which does notice only
+        // past the busy gate; here the gate itself refuses silently).
+        // This test pins the no-turn, no-toggle half.
+        struct RefuseToggleAgent;
+        #[async_trait::async_trait]
+        impl AgentLoop for RefuseToggleAgent {
+            async fn chat(&self, _prompt: &str) -> Result<String, String> {
+                Ok(String::new())
+            }
+            fn set_mcp_server_enabled(
+                &self,
+                _name: &str,
+                _enabled: bool,
+            ) -> Result<String, String> {
+                panic!("toggle must not run while busy")
+            }
+        }
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.busy = true;
+        let agent = std::sync::Arc::new(RefuseToggleAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/mcp off py".to_string();
+        app.cursor = 11;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(app.busy, "busy turn must not be disturbed");
+        app.busy = false;
+    }
+
+    #[tokio::test]
+    async fn slash_mcp_login_logout_without_turn() {
+        /// Stub with login/logout behavior.
+        struct LoginStubAgent;
+        #[async_trait::async_trait]
+        impl AgentLoop for LoginStubAgent {
+            async fn chat(&self, _prompt: &str) -> Result<String, String> {
+                Ok(String::new())
+            }
+            fn mcp_login(&self, name: &str) -> Result<String, String> {
+                Ok(format!("https://auth.example.com/login?for={name}"))
+            }
+            fn mcp_logout(&self, name: &str) -> Result<String, String> {
+                Ok(format!("mcp `{name}` logged out"))
+            }
+        }
+        let agent = std::sync::Arc::new(LoginStubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        // Login prints the URL; no turn starts.
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.input = "/mcp login github".to_string();
+        app.cursor = 17;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy);
+        let flat = print_flat(&app);
+        assert!(
+            flat.contains("https://auth.example.com/login?for=github"),
+            "got: {flat}"
+        );
+        // Logout notices; no turn starts.
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.input = "/mcp logout github".to_string();
+        app.cursor = 18;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy);
+        assert!(print_flat(&app).contains("logged out"));
     }
 
     #[tokio::test]
@@ -6405,7 +6711,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         for name in [
-            "/quit", "/new", "/help", "/theme", "/init", "/skills", "/model", "/effort", "/context",
+            "/quit", "/new", "/help", "/theme", "/init", "/skills", "/model", "/effort",
+            "/context", "/mcp",
         ] {
             assert!(flat.contains(name), "help missing {name}: {flat}");
         }

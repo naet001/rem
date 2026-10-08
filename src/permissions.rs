@@ -138,6 +138,13 @@ pub fn classify_mode(
                 }
             }
         }
+        // MCP tools (Claude `mcp__server__tool` names): Confirm
+        // by default — defense-in-depth over the unknown-tool fallthrough,
+        // plus explicit Yolo/Plan semantics. Plan already denied above,
+        // Yolo already allowed above.
+        _ if tool_name.starts_with("mcp__") => Verdict::Confirm {
+            reason: format!("third-party MCP tool `{tool_name}` needs approval"),
+        },
         // Unknown future tools: fail closed to approval, never auto.
         _ => Verdict::Confirm {
             reason: format!("unknown tool `{tool_name}` needs approval"),
@@ -635,6 +642,7 @@ impl PermissionHook {
                 }
             }
             "web_fetch" | "web_search" => ("High", format!("Network. {reason}")),
+            _ if tool_name.starts_with("mcp__") => ("High", format!("Third-party. {reason}")),
             _ => ("Med", format!("Unknown tool. Careful. {reason}")),
         }
     }
@@ -1001,6 +1009,55 @@ mod tests {
     }
 
     #[test]
+    fn mcp_risk_is_high_third_party() {
+        let (level, why) = PermissionHook::risk(
+            "mcp__github__create_issue",
+            "third-party tool needs approval",
+        );
+        assert_eq!(level, "High");
+        assert!(why.contains("Third-party"), "got: {why}");
+    }
+
+    #[test]
+    fn mcp_tools_confirm_by_default() {
+        for mode in [Mode::Auto, Mode::Manual] {
+            let v = classify_mode(
+                "mcp__github__create_issue",
+                &args(serde_json::json!({})),
+                &root(),
+                mode,
+            );
+            match v {
+                Verdict::Confirm { reason } => {
+                    assert!(
+                        reason.contains("MCP") || reason.contains("third-party"),
+                        "explicit mcp__ arm, got: {reason}"
+                    );
+                }
+                other => panic!("expected Confirm, got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_tools_yolo_allows_plan_denies() {
+        let v = classify_mode(
+            "mcp__github__create_issue",
+            &args(serde_json::json!({})),
+            &root(),
+            Mode::Yolo,
+        );
+        assert_eq!(v, Verdict::Allow);
+        let v = classify_mode(
+            "mcp__github__create_issue",
+            &args(serde_json::json!({})),
+            &root(),
+            Mode::Plan,
+        );
+        assert!(matches!(v, Verdict::Deny { .. }), "{v:?}");
+    }
+
+    #[test]
     fn rule_keys_are_scoped() {
         assert_eq!(
             rule_key("bash", &serde_json::json!({"command": "cargo test"})),
@@ -1012,6 +1069,27 @@ mod tests {
                 &serde_json::json!({"path": "a.txt", "content": "x"})
             ),
             "write:a.txt"
+        );
+        // MCP keys scope by exact namespaced tool + args, never by prefix.
+        let args = serde_json::json!({"owner": "acme", "n": 3});
+        assert_eq!(
+            rule_key("mcp__github__create_issue", &args),
+            format!("mcp__github__create_issue:{args}")
+        );
+        let other = serde_json::json!({"owner": "acme", "n": 4});
+        assert_ne!(
+            rule_key("mcp__github__create_issue", &args),
+            rule_key("mcp__github__create_issue", &other)
+        );
+    }
+
+    #[test]
+    fn mcp_preview_falls_back_to_compact_args() {
+        // Pins the Ticket 02 contract: wildcard covers mcp__* today.
+        let args = serde_json::json!({"owner": "acme", "title": "bug"});
+        assert_eq!(
+            PermissionHook::preview("mcp__github__create_issue", &args),
+            args.to_string()
         );
     }
 
