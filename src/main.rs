@@ -1,5 +1,7 @@
 mod agent;
+mod auto_rules;
 mod config;
+mod fs_guard;
 mod context;
 mod headless;
 mod history;
@@ -8,10 +10,14 @@ mod mcp;
 mod modes;
 mod permissions;
 mod popup;
+mod rules;
+mod sandbox;
 mod sessions;
+mod settings;
 mod skills;
 mod theme;
 mod tools;
+mod trust;
 mod tui;
 
 use agent::{AgentLoop, RigAgent};

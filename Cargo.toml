@@ -20,6 +20,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 html-escape = "0.2"
 toml = "0.8"
 dirs = "7.0"
+libc = "0.2"
+ignore = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rmcp = { version = "2", features = ["client", "auth", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 oauth2 = "5"
