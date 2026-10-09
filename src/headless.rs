@@ -1,18 +1,13 @@
-//! Headless `-p` run path (P0-#2, grilled decisions).
+//! Headless `-p` run path.
 //!
 //! - Only `-p`/`--print` (no `exec` subcommand).
-//! - Deny-by-default: no approver attached, `Confirm` fails closed to skip.
-//!   `--allow-all` attaches an auto-approver (`Confirm` -> `Approve`);
-//!   `Deny` (annihilators) still blocks — the safety floor holds.
 //! - Text default on stdout (pipeable); `--output json|jsonl` event stream.
 //! - Stdin (piped) prepended + `-p` appended; either alone is allowed.
-//! - Single `--mode <name>` flag only; persisted sessions + `--resume`.
+//! - Persisted sessions + `--resume`.
 
 use crate::{
     agent::{AgentLoop, RigAgent, ToolEvent},
     config::Config,
-    modes::Mode,
-    permissions::ApprovalDecision,
 };
 
 /// Stdout shape for `rem -p`.
@@ -39,8 +34,6 @@ impl OutputFormat {
 pub struct PrintOpts {
     pub prompt: Option<String>,
     pub resume_id: Option<String>,
-    pub mode: Option<Mode>,
-    pub allow_all: bool,
     pub output: OutputFormat,
 }
 
@@ -197,24 +190,18 @@ pub async fn run_print(opts: PrintOpts) -> i32 {
     }
     let session_id = session.id.clone();
 
-    let (approval_tx, approval_rx) = crate::permissions::approval_channel();
-    let agent = match RigAgent::new(&cfg, approval_tx, project_root.clone()) {
+    let agent = match RigAgent::new(&cfg, project_root.clone()) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("rem: {e}");
             return 1;
         }
     };
-
-    // Headless mode flag (grilled: single `--mode`, default `manual`).
-    if let Some(m) = opts.mode
-        && let Ok(mut guard) = agent.mode_handle().lock()
-    {
-        *guard = m;
-    }
+    // Headless has no TUI loop to observe completion: `background:true`
+    // degrades to inline (same result, no polling) instead of detaching.
+    agent.set_background_enabled(false);
 
     let agent = std::sync::Arc::new(agent);
-
     // Resume: switch to the stored provider tag + import history (TUI parity).
     // Unknown tags warn on stderr but keep history on the current client.
     if is_resume {
@@ -262,23 +249,6 @@ pub async fn run_print(opts: PrintOpts) -> i32 {
             eprintln!("rem: @ mention: {e}");
             return 1;
         }
-    }
-
-    // Approver wiring (grilled deny-by-default):
-    // - default: drop `rx` so `Confirm` fails closed to skip in-run.
-    // - `--allow-all`: background task auto-approves every `Confirm`;
-    //   `Deny` verdicts never reach the channel, so annihilators stay blocked.
-    if opts.allow_all {
-        let mut rx = approval_rx;
-        tokio::spawn(async move {
-            while let Some(req) = rx.recv().await {
-                let _ = req.reply.send(ApprovalDecision::Approve {
-                    comment: String::new(),
-                });
-            }
-        });
-    } else {
-        drop(approval_rx);
     }
 
     let result = agent.chat(&prompt_text).await;

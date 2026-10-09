@@ -240,7 +240,7 @@ pub fn discover(project_root: &std::path::Path) -> Vec<Skill> {
     discover_in(&roots)
 }
 
-const SKILLS_HEADER: &str = "\n\nAvailable skills (name — description — SKILL.md path). Read the SKILL.md with the read tool when the task matches, or the user may force with /skill:<name> (trailing text is the task). Sibling bundle files are listed; read them with read/glob and run scripts via bash (normal approvals apply):\n";
+const SKILLS_HEADER: &str = "\n\nAvailable skills (name — description — SKILL.md path). Read the SKILL.md with the read tool when the task matches, or the user may force with /skill:<name> (trailing text is the task). Sibling bundle files are listed; read them with read/glob and run scripts via bash:\n";
 
 /// Preamble index. Empty when no skills. Descriptions already capped at parse.
 pub fn preamble_section(skills: &[Skill]) -> String {

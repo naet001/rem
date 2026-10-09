@@ -21,12 +21,12 @@ Legend: `[ ]` todo, `[/]` in-progress branch, `[x]` done.
 - [x] `--mode <name>` single flag only (no `--yolo`/`--plan` shorthands; default `manual`)
 - [x] `--resume <id>` works headless; deny-by-default + `--allow-all` (Confirm→Approve, Deny floor holds)
 
-### 3. MCP client (`feat/mcp` exists, not landed)
-- [ ] Land `feat/mcp`: MCP client (stdio + SSE/http)
-- [ ] MCP servers from config (`~/.config/rem/mcp.toml` or `[mcp]` section)
-- [ ] Discovered MCP tools flow through `PermissionHook::classify` (fail-closed `Confirm`)
-- [ ] `/mcp` command: list servers/tools, reconnect, auth status
-- [ ] MCP tools appear in preamble + `last_tool_events` tree
+### 3. MCP client (landed 2026-10-06, tickets 01-06 in `.scratch/mcp-client/issues/`)
+- [x] Land MCP client: stdio + streamable HTTP (legacy SSE out — rmcp 2.2 ships no SSE client dialect, per ADR-0013)
+- [x] MCP servers from `~/.config/rem/mcp.json` (Claude `mcpServers` shape, `${VAR}`/`${VAR:-default}` expansion; supersedes `mcp.toml` wording)
+- [x] Discovered MCP tools flow through `PermissionHook::classify` (explicit `mcp__*` Confirm arm; Yolo Allow, Plan Deny; High risk)
+- [x] `/mcp` command: list servers/tools, on/off toggle, login/logout, connected/failed/needs-auth status
+- [x] MCP tools appear in preamble index + `last_tool_events` tree; full OAuth 2.0 (0600 token store, localhost callback, 401 refresh-once → needs-auth)
 
 ### 4. `@file` / ref-files (`feat/ref-files` landed as `f5589b8`; `@dir/` + multi-ref + blocks verified, ranges + docs landed 2026-10-06)
 - [x] Land `feat/ref-files`: `@path` expansion before `chat()`
@@ -42,17 +42,17 @@ Legend: `[ ]` todo, `[/]` in-progress branch, `[x]` done.
 - [x] Retry + rate-limit backoff + timeout errors surfaced per-turn
 - [ ] Token meter + `/cost` + `/context` (used/total, compaction point)
 
-### 6. Subagents + task decomposition (single linear loop today)
-- [ ] `TodoWrite` tool (list, status, transcript UI)
-- [ ] `Task` tool: spawn subagent with scoped prompt/tools (even serial queue v1)
-- [ ] Parallel subagent fan-out (bounded) + result merge into parent turn
-- [ ] Background tasks with polling (`/tasks`)
+### 6. Subagents + task decomposition (serial v1 landed 2026-10-07: ADR-0015; parallel + background landed 2026-10-08: ADR-0016)
+- [x] `TodoWrite` tool (list, status, transcript UI)
+- [x] `Task` tool: spawn subagent with scoped prompt/tools (serial queue v1: fresh context, shared approval channel, depth-1 denied-at-schema)
+- [x] Parallel subagent fan-out (bounded) + result merge into parent turn
+- [x] Background tasks with polling (`/tasks`)
 
 ### 7. Checkpoints / undo / rewind (no revert today)
-- [ ] Snapshot `git diff` + `messages_json` before each mutate turn
-- [ ] `/rewind [n]` restores files + history; `/undo` last mutate
-- [ ] Diff-accept flow: show patch, `[a]ccept / [r]eject` before `edit/write` lands
-- [ ] `apply_patch`-style fuzzy edit tool (replace exact-`oldText`-only `edit`)
+- [x] Snapshot `git diff` + `messages_json` before each mutate turn
+- [x] `/rewind [n]` restores files + history; `/undo` last mutate
+- [x] Diff-accept flow: show patch, `[a]ccept / [r]eject` before `edit/write` lands
+- [x] `apply_patch`-style fuzzy edit tool (replace exact-`oldText`-only `edit`)
 
 ## P1 — expected by users
 

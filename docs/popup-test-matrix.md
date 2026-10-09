@@ -14,11 +14,6 @@
 | Filter | Esc exits filter before any popup dismissal | Resume |
 | Resume | Enter resumes selected session | Resume |
 | Resume | Empty results render safely | Resume |
-| Approval | Popup is blocking and FIFO | Permissions |
-| Approval | Later approvals cannot be selected | Permissions |
-| Approval | Existing approve/always/deny/abort actions remain unchanged | Permissions |
-| Approval | Risk/reason appears before command details | Permissions |
-| Approval | Risk labels and restrained color cues are visible | Permissions |
 | Policy | `q` follows popup-specific quit/abort policy | Both |
 | Layout | Long lists window/scroll within popup bounds | Both |
 | Layout | Narrow/short terminals do not panic or hide all actions | Both |

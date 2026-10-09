@@ -4,3 +4,6 @@
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
+
+# pi session HTML exports — local working artifacts, never committed.
+pi-session-*.html
