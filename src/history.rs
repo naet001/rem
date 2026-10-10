@@ -16,6 +16,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme::Theme;
+use crate::tools::{TodoItem, TodoStatus};
 
 /// Hanging-indent gutter: `• ` on the first wrapped row, spaces after.
 const GUTTER: usize = 2;
@@ -300,6 +301,96 @@ pub(crate) fn tool_row(
     prepend_blank(hang(lines, bullet(), width))
 }
 
+/// Max todo items shown in the pinned panel; overflow collapses to `+N more`.
+pub(crate) const TODO_PIN_MAX_ITEMS: usize = 10;
+
+/// Pinned-panel height in rows for `count` todos: 0 when empty, else one
+/// header row plus one row per visible item (plus a `+N more` row on overflow).
+pub(crate) fn todo_pin_height(count: usize) -> u16 {
+    match count {
+        0 => 0,
+        _ => {
+            let visible = count.min(TODO_PIN_MAX_ITEMS);
+            (1 + visible + usize::from(count > visible)) as u16
+        }
+    }
+}
+
+/// Live todo tree pinned to the top of the bottom pane (not scrollback):
+/// a `Todos · done/total` header plus one truncated row per item with
+/// `├`/`└` branches and `○`/`◌`/`●` status marks. Empty renders nothing so
+/// the panel costs zero rows when quiet.
+pub(crate) fn todo_pin_rows(todos: &[TodoItem], width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    if todos.is_empty() {
+        return Vec::new();
+    }
+    let done = todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Completed)
+        .count();
+    let mut rows = vec![Line::from(vec![
+        Span::styled(
+            "Todos",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" · {done}/{}", todos.len()), dim()),
+    ])];
+    let visible = todos.len().min(TODO_PIN_MAX_ITEMS);
+    let overflow = todos.len() - visible;
+    for (i, item) in todos.iter().take(visible).enumerate() {
+        let fork = match i + 1 == visible && overflow == 0 {
+            true => "└ ",
+            false => "├ ",
+        };
+        let (mark, style) = match item.status {
+            TodoStatus::Pending => ("○ ", dim()),
+            TodoStatus::InProgress => ("◌ ", Style::default().fg(theme.accent)),
+            TodoStatus::Completed => ("● ", Style::default().fg(theme.add_fg)),
+        };
+        let flat = item
+            .content
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let budget = width
+            .saturating_sub(col_width(fork) + col_width(mark))
+            .max(1);
+        rows.push(Line::from(vec![
+            Span::styled(fork.to_string(), dim()),
+            Span::styled(mark.to_string(), style),
+            Span::styled(truncate_width(&flat, budget), style),
+        ]));
+    }
+    if overflow > 0 {
+        rows.push(Line::from(vec![
+            Span::styled("└ ".to_string(), dim()),
+            Span::styled(format!("+{overflow} more"), faint()),
+        ]));
+    }
+    rows
+}
+
+/// Truncate `s` to at most `max` display columns, appending `…` when cut.
+fn truncate_width(s: &str, max: usize) -> String {
+    if col_width(s) <= max {
+        return s.to_string();
+    }
+    let mut width = 0;
+    let mut out = String::new();
+    for ch in s.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + w + 1 > max {
+            break;
+        }
+        out.push(ch);
+        width += w;
+    }
+    out.push('…');
+    out
+}
+
 /// A diff body (`git_diff` output): `verb path` header with `+N −M` counts
 /// pushed right, then full-row tinted bands with a darker mark glyph.
 pub(crate) fn patch_row(
@@ -343,35 +434,154 @@ pub(crate) fn patch_row(
     prepend_blank(hang(lines, bullet(), width))
 }
 
-/// Tint a unified-ish patch body row by row. Context lines stay faint on the
-/// terminal background; added/removed lines get full-width bands.
+/// Tint a unified-ish patch body row by row. File headers (`---`/`+++`,
+/// `diff --git`, `index`) and hunk headers (`@@ … @@`) are skipped: the
+/// hunk start lines seed old/new counters, and every change row renders a
+/// `marker + number` gutter (context/add show the new-file number, deletes
+/// show the old-file number) over the code without its ` `/`+`/`-` prefix.
+/// Context rows stay faint on the terminal background; added/removed rows
+/// get full-width green/red bands with a darker mark glyph. Long code lines
+/// wrap within the code budget; continuations carry a blank gutter so the
+/// band stays rectangular.
 fn diff_lines(body: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
-    body.lines()
-        .map(|raw| {
-            let (fg, bg, mark) = match raw.chars().next() {
-                Some('+') if !raw.starts_with("+++") => {
-                    (theme.add_fg, theme.add_bg, Some(theme.add_mark))
-                }
-                Some('-') if !raw.starts_with("---") => {
-                    (theme.del_fg, theme.del_bg, Some(theme.del_mark))
-                }
-                _ => (Color::DarkGray, Color::Reset, None),
+    enum Kind {
+        Context,
+        Add,
+        Del,
+        Note,
+    }
+    struct Row {
+        kind: Kind,
+        num: Option<usize>,
+        text: String,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    let mut old_no: usize = 1;
+    let mut new_no: usize = 1;
+    for raw in body.lines() {
+        if raw.starts_with("--- ")
+            || raw.starts_with("+++ ")
+            || raw.starts_with("diff --git")
+            || raw.starts_with("index ")
+            || raw.starts_with("Binary ")
+        {
+            continue;
+        }
+        if let Some((old_start, new_start)) = parse_hunk_start(raw) {
+            old_no = old_start.max(1);
+            new_no = new_start.max(1);
+            continue;
+        }
+        if raw.starts_with('\\') {
+            rows.push(Row {
+                kind: Kind::Note,
+                num: None,
+                text: raw.to_string(),
+            });
+            continue;
+        }
+        match raw.chars().next() {
+            Some('+') if !raw.starts_with("+++") => {
+                rows.push(Row {
+                    kind: Kind::Add,
+                    num: Some(new_no),
+                    text: raw[1..].to_string(),
+                });
+                new_no += 1;
+            }
+            Some('-') if !raw.starts_with("---") => {
+                rows.push(Row {
+                    kind: Kind::Del,
+                    num: Some(old_no),
+                    text: raw[1..].to_string(),
+                });
+                old_no += 1;
+            }
+            Some(' ') => {
+                rows.push(Row {
+                    kind: Kind::Context,
+                    num: Some(new_no),
+                    text: raw[1..].to_string(),
+                });
+                old_no += 1;
+                new_no += 1;
+            }
+            None => {
+                rows.push(Row {
+                    kind: Kind::Context,
+                    num: Some(new_no),
+                    text: String::new(),
+                });
+                old_no += 1;
+                new_no += 1;
+            }
+            _ => {
+                rows.push(Row {
+                    kind: Kind::Note,
+                    num: None,
+                    text: raw.to_string(),
+                });
+            }
+        }
+    }
+    let num_w = rows
+        .iter()
+        .filter_map(|r| r.num)
+        .max()
+        .map(|m| m.to_string().len())
+        .unwrap_or(1)
+        .max(1);
+    let gutter_w = num_w + 2;
+    let code_budget = width.saturating_sub(gutter_w).max(1);
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (fg, bg, mark_fg, marker) = match row.kind {
+            Kind::Add => (theme.add_fg, theme.add_bg, theme.add_mark, '+'),
+            Kind::Del => (theme.del_fg, theme.del_bg, theme.del_mark, '-'),
+            Kind::Context => (Color::DarkGray, Color::Reset, Color::DarkGray, ' '),
+            Kind::Note => (Color::DarkGray, Color::Reset, Color::DarkGray, ' '),
+        };
+        let gutter_text = match row.num {
+            Some(n) => format!("{marker}{n:>num_w$} "),
+            None => " ".repeat(gutter_w),
+        };
+        let gutter_style = Style::default().fg(mark_fg).bg(bg);
+        let code_style = Style::default().fg(fg).bg(bg);
+        let chunks = match row.text.is_empty() {
+            true => vec![String::new()],
+            false => wrapped(&row.text, code_budget),
+        };
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let gutter = match i == 0 {
+                true => Span::styled(gutter_text.clone(), gutter_style),
+                false => Span::styled(" ".repeat(gutter_w), gutter_style),
             };
-            let style = Style::default().fg(fg).bg(bg);
-            let text = wrapped(raw, width).first().cloned().unwrap_or_default();
-            let line = match (mark, text.is_empty()) {
-                (Some(mark_fg), false) => {
-                    let (head, rest) = text.split_at(1);
-                    Line::from(vec![
-                        Span::styled(head.to_string(), Style::default().fg(mark_fg).bg(bg)),
-                        Span::styled(rest.to_string(), style),
-                    ])
-                }
-                _ => Line::from(Span::styled(text, style)),
-            };
-            pad_to(line, width, style)
-        })
-        .collect()
+            let line = Line::from(vec![gutter, Span::styled(chunk, code_style)]);
+            out.push(pad_to(line, width, code_style));
+        }
+    }
+    out
+}
+
+/// Parse a unified hunk header (`@@ -old[,len] +new[,len] @@ …`) into its
+/// 1-indexed old/new start lines. Anything else returns `None`.
+fn parse_hunk_start(line: &str) -> Option<(usize, usize)> {
+    let line = line.strip_prefix("@@ ")?;
+    let (old_part, rest) = line.split_once(' ')?;
+    let (new_part, _) = rest.split_once(" @@").unwrap_or((rest, ""));
+    let old_start = old_part
+        .strip_prefix('-')?
+        .split(',')
+        .next()?
+        .parse::<usize>()
+        .ok()?;
+    let new_start = new_part
+        .strip_prefix('+')?
+        .split(',')
+        .next()?
+        .parse::<usize>()
+        .ok()?;
+    Some((old_start, new_start))
 }
 
 enum Elided<'a> {
@@ -495,17 +705,56 @@ mod tests {
         let text: Vec<String> = plain(&out);
         assert!(text[1].contains("+1"), "got: {:?}", text);
         assert!(text[1].contains("−1"), "got: {:?}", text);
-        // Added line carries the add background; context does not.
+        // File headers never render; the gutter carries the change marks.
+        assert!(!text.iter().any(|l| l.contains("--- a/f")), "got: {text:?}");
+        // Added line carries the green band + `+` gutter; deletes are red.
         let add_line = out
             .iter()
-            .find(|l| plain(std::slice::from_ref(l))[0].contains("+ add"));
+            .find(|l| plain(std::slice::from_ref(l))[0].contains("add"));
         let add_line = add_line.expect("added line present");
+        let add_text = plain(std::slice::from_ref(add_line))[0].clone();
+        assert!(add_text.contains("+"), "got: {add_text:?}");
         assert_eq!(add_line.spans.last().unwrap().style.bg, Some(theme.add_bg));
+        assert_eq!(add_line.spans.last().unwrap().style.fg, Some(theme.add_fg));
+        let del_line = out
+            .iter()
+            .find(|l| plain(std::slice::from_ref(l))[0].contains("del"));
+        let del_line = del_line.expect("deleted line present");
+        let del_text = plain(std::slice::from_ref(del_line))[0].clone();
+        assert!(del_text.contains("-"), "got: {del_text:?}");
+        assert_eq!(del_line.spans.last().unwrap().style.bg, Some(theme.del_bg));
+        assert_eq!(del_line.spans.last().unwrap().style.fg, Some(theme.del_fg));
         let ctx_line = out
             .iter()
-            .find(|l| plain(std::slice::from_ref(l))[0].contains(" ctx"))
-            .expect("context line present");
+            .find(|l| plain(std::slice::from_ref(l))[0].contains("ctx"));
+        let ctx_line = ctx_line.expect("context line present");
         assert_eq!(ctx_line.spans.last().unwrap().style.bg, Some(Color::Reset));
+    }
+
+    #[test]
+    fn patch_row_numbers_track_hunk_starts_like_screenshot() {
+        let theme = Theme::default();
+        let body = "--- a/src/history.rs\n+++ b/src/history.rs\n@@ -360,6 +360,6 @@\n ctx-a\n-old\n+new\n ctx-b";
+        let out = patch_row("Edit", "src/history.rs", body, 60, &theme);
+        let text: Vec<String> = plain(&out);
+        // Hunk header feeds the counters; context uses the new-file number.
+        assert!(text.iter().any(|l| l.contains("+361 new")), "got: {text:?}");
+        assert!(text.iter().any(|l| l.contains("-361 old")), "got: {text:?}");
+        assert!(
+            text.iter().any(|l| l.contains(" 360 ctx-a")),
+            "got: {text:?}"
+        );
+        assert!(!text.iter().any(|l| l.contains("@@")), "got: {text:?}");
+    }
+
+    #[test]
+    fn parse_hunk_start_reads_old_and_new_starts() {
+        assert_eq!(
+            parse_hunk_start("@@ -360,6 +361,5 @@ fn x"),
+            Some((360, 361))
+        );
+        assert_eq!(parse_hunk_start("@@ -1 +1 @@"), Some((1, 1)));
+        assert_eq!(parse_hunk_start(" ctx"), None);
     }
 
     #[test]
@@ -516,6 +765,75 @@ mod tests {
         assert_eq!(text[0], "", "got: {text:?}");
         assert_eq!(text[1], "─".repeat(20), "got: {text:?}");
         assert_eq!(out[1].spans[0].style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn todo_pin_rows_match_reference_tree() {
+        let theme = Theme::default();
+        let todos = vec![
+            TodoItem {
+                content: "Add shared file diff helper with tests".to_string(),
+                status: TodoStatus::Completed,
+            },
+            TodoItem {
+                content: "Emit diffs from write/edit tools".to_string(),
+                status: TodoStatus::InProgress,
+            },
+            TodoItem {
+                content: "Render write/edit as patch rows in TUI".to_string(),
+                status: TodoStatus::Pending,
+            },
+            TodoItem {
+                content: "Verify with tests, fmt, clippy".to_string(),
+                status: TodoStatus::Pending,
+            },
+        ];
+        let out = todo_pin_rows(&todos, 60, &theme);
+        let text: Vec<String> = plain(&out);
+        assert_eq!(text.len(), 5, "got: {text:?}");
+        assert_eq!(text[0], "Todos · 1/4", "got: {text:?}");
+        assert_eq!(
+            text[1], "├ ● Add shared file diff helper with tests",
+            "got: {text:?}"
+        );
+        assert_eq!(
+            text[2], "├ ◌ Emit diffs from write/edit tools",
+            "got: {text:?}"
+        );
+        assert_eq!(
+            text[4], "└ ○ Verify with tests, fmt, clippy",
+            "got: {text:?}"
+        );
+        assert_eq!(todo_pin_height(todos.len()), 5);
+        assert_eq!(out[0].spans[0].style.fg, Some(theme.accent));
+        assert_eq!(out[3].spans[1].style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn todo_pin_empty_renders_nothing_and_collapses_overflow() {
+        let theme = Theme::default();
+        assert!(todo_pin_rows(&[], 60, &theme).is_empty());
+        assert_eq!(todo_pin_height(0), 0);
+        let todos = (0..12)
+            .map(|i| TodoItem {
+                content: format!("task {i}"),
+                status: TodoStatus::Pending,
+            })
+            .collect::<Vec<_>>();
+        let out = todo_pin_rows(&todos, 60, &theme);
+        let text: Vec<String> = plain(&out);
+        assert_eq!(out.len(), 12, "got: {text:?}");
+        assert_eq!(todo_pin_height(12), 12);
+        assert!(text[0].starts_with("Todos · 0/12"), "got: {text:?}");
+        assert_eq!(text[11], "└ +2 more", "got: {text:?}");
+        assert!(text[1].starts_with("├ ○ task 0"), "got: {text:?}");
+        let long = vec![TodoItem {
+            content: "a very long todo item that must not overflow the panel width".to_string(),
+            status: TodoStatus::Pending,
+        }];
+        let rows = todo_pin_rows(&long, 20, &theme);
+        let flat: Vec<String> = plain(&rows);
+        assert!(flat[1].ends_with('…'), "got: {flat:?}");
     }
 
     #[test]

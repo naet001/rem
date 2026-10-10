@@ -141,10 +141,11 @@ Missing keys and bad hex fall back per-key to the built-in palette. See `docs/th
 13 tools, wired through Rig's multi-step loop (up to 100 model/tool steps per turn):
 
 `read`, `write`, `edit`, `bash`, `list_directory`, `git_status`, `git_diff`, `grep`, `glob`, `web_fetch` (URL → text), `web_search` (DuckDuckGo, no key), `todowrite`, `task`.
+`write`/`edit` results carry a unified diff of the change, rendered as a tinted patch in the transcript (same bands as `git_diff`).
 
 ### Subagents (serial, v1)
 
-`todowrite` owns the session task list. Pass the full list every call; each item is `content` + `status` (`pending` / `in_progress` / `completed`). Unknown fields (e.g. Claude-style `priority`) are accepted and ignored. `/todos` shows the list; `/new` clears it.
+`todowrite` owns the session task list. For medium-complex or larger tasks, first state your understanding of the task and your planned approach in the reply, then pass the full list every call; each item is `content` + `status` (`pending` / `in_progress` / `completed`). Trivial one-step tasks skip the list. Unknown fields (e.g. Claude-style `priority`) are accepted and ignored. `/todos` shows the list; `/new` clears it.
 
 ```
 {"todos": [{"content": "write failing test", "status": "completed"}, {"content": "make it pass", "status": "in_progress"}]}

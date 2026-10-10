@@ -60,8 +60,9 @@ impl Tool for EditTool {
     }
 
     async fn call(&self, _ctx: &mut ToolContext, args: Self::Args) -> Result<String, ToolError> {
-        let mut content = std::fs::read_to_string(&args.path)
+        let old = std::fs::read_to_string(&args.path)
             .map_err(|e| ToolError(format!("edit {}: {e}", args.path)))?;
+        let mut content = old.clone();
         let mut applied = 0;
         for e in &args.edits {
             match apply_edit(&content, &e.oldText, &e.newText, args.fuzzy) {
@@ -74,11 +75,17 @@ impl Tool for EditTool {
         }
         std::fs::write(&args.path, &content)
             .map_err(|e| ToolError(format!("edit {}: write back: {e}", args.path)))?;
-        Ok(format!(
+        let summary = format!(
             "applied {applied} edit(s) to {} ({} bytes)",
             args.path,
             content.len()
-        ))
+        );
+        let diff = super::unified_diff(&args.path, &old, &content);
+        if diff.is_empty() {
+            Ok(summary)
+        } else {
+            Ok(format!("{summary}\n{diff}"))
+        }
     }
 }
 
@@ -246,5 +253,28 @@ mod tests {
         }))
         .unwrap();
         assert!(b.fuzzy);
+    }
+
+    #[tokio::test]
+    async fn edit_call_output_carries_diff_below_summary() {
+        let dir = std::env::temp_dir().join(format!("rem-edit-diff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "foo bar\n").unwrap();
+
+        let tool = EditTool;
+        let mut ctx = ToolContext::new();
+        let args: EditArgs = serde_json::from_value(serde_json::json!({
+            "path": file.to_string_lossy(),
+            "edits": [{"oldText": "foo", "newText": "FOO"}]
+        }))
+        .unwrap();
+        let out = tool.call(&mut ctx, args).await.unwrap();
+        assert!(out.starts_with("applied 1 edit(s)"), "got: {out}");
+        assert!(out.lines().any(|l| l == "-foo bar"), "got: {out}");
+        assert!(out.lines().any(|l| l == "+FOO bar"), "got: {out}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

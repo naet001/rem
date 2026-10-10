@@ -560,8 +560,8 @@ fn base_preamble() -> String {
          Use the read/write/edit/bash/list_directory/git_status/git_diff/grep/glob/web_fetch/web_search/todowrite/task tools to inspect and change files. \
          list_directory lists a dir, glob finds files by pattern, grep searches contents, git_status/git_diff inspect git state. \
          web_search searches the web (DuckDuckGo, no key), web_fetch reads a URL as text. \
+         For medium-complex or larger tasks, first state your understanding of the task and your planned approach in the reply, then break the work into a short todowrite list and work it top to bottom (trivial one-step tasks skip the list). \
          todowrite owns the session task list: pass the full list each call with content + status (pending/in_progress/completed). \
-         task spawns scoped subagent(s): single description (short label) + prompt (full task), or tasks[] array (up to 8 independent subtasks, 4 at a time, merged as ## sections in input order); background:true detaches the call and delivers the summary on a later turn. Children run under the same tools minus task (no recursion). \
          Bash runs `sh -c` in the project dir (30s timeout). \
          Prefer reading a file before editing it. Keep replies concise.",
     )
@@ -1696,6 +1696,17 @@ default_model = "gpt-4o"
         // Empty section adds nothing.
         assert!(!build_preamble(&dir, &[], "").contains("MCP"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn base_preamble_directs_idea_before_todos() {
+        let text = base_preamble();
+        for want in ["medium-complex", "state your understanding", "todowrite"] {
+            assert!(text.contains(want), "preamble missing {want}: {text}");
+        }
+        let idea = text.find("state your understanding").expect("idea first");
+        let todos = text.find("todowrite owns").expect("todos second");
+        assert!(idea < todos, "idea must precede todowrite: {text}");
     }
 
     /// Live bridge coverage: sync trait methods over the async MCP

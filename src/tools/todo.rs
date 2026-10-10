@@ -43,7 +43,7 @@ impl Tool for TodoWriteTool {
     type Error = ToolError;
 
     fn description(&self) -> String {
-        "Owns the session task list. Pass the full list each call; each item has content + status (pending/in_progress/completed).".to_string()
+        "Owns the session task list. For medium-complex or larger tasks, state your understanding and plan in the reply first, then pass the full list each call with content + status (pending/in_progress/completed).".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {

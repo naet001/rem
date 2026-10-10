@@ -58,7 +58,7 @@
 
 ## Subagents (ADR-0015, ADR-0016)
 
-- **TodoWrite**: `todowrite` tool owning the session task list (full-list replace; `content` + `status` `pending` / `in_progress` / `completed`). Agent-shared state, never persisted; `/todos` shows it, `/new` clears it.
+- **TodoWrite**: `todowrite` tool owning the session task list (full-list replace; `content` + `status` `pending` / `in_progress` / `completed`). For medium-complex or larger tasks the agent first states its understanding + plan in the reply, then breaks the work into todos (trivial one-step tasks skip the list). Agent-shared state, never persisted; `/todos` shows it, `/new` clears it.
 - **Task**: `task` tool spawning scoped subagent(s): single (`description` label + `prompt`) or fan-out (`tasks[]`, up to 8, 4 at a time, merged as `##` sections in input order). Fresh context per child, identical preamble + delegation note, same tools minus `task` (depth-1, no recursion). Parent transcript shows one row.
 - **Fan-out**: bounded-parallel `tasks[]` batch on a scoped `JoinSet` (drop-the-future aborts all, so Esc works with zero TUI changes). Partial merge: per-child `## <label> (error)` blocks, never whole-batch failure.
 - **Background**: `background:true` detaches the call into the session `BackgroundStore` (`task-N` ids, session-memory only, `/new` clears, headless degrades to inline). Result returns via TUI inject-on-next-submit; `/tasks` lists, `/tasks <id>` shows the summary.

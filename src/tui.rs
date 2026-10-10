@@ -1634,6 +1634,9 @@ struct App {
     /// Freeze transcript drain for one frame after a terminal resize so
     /// queued rows cannot race viewport repositioning.
     skip_drain_once: bool,
+    /// Pinned todo snapshot for the top-of-pane tree. Refreshed from
+    /// `agent.list_todos()` every event-loop frame; empty hides the panel.
+    todos: Vec<crate::tools::TodoItem>,
 }
 
 /// Abort the in-flight turn worker + live-feed watcher (Task 1 / ADR-0006).
@@ -1667,6 +1670,19 @@ fn abort_turn(app: &mut App) {
         ));
     }
     app.dirty = true;
+}
+
+/// Split a `write`/`edit` tool output into its one-line summary and the
+/// unified diff below it. Returns `None` when the output carries no diff
+/// (no-change write) or the failure reason is not a diff at all — those
+/// keep the flat `tool_row` rendering.
+fn split_diff_body(output: &str) -> Option<(&str, &str)> {
+    let (summary, rest) = output.split_once('\n')?;
+    let diff = rest.strip_prefix("--- a/").map(|_| rest).unwrap_or("");
+    match diff.is_empty() {
+        true => None,
+        false => Some((summary, diff)),
+    }
 }
 
 /// Format turn duration like Aster's trailer (`22.4s`).
@@ -1709,6 +1725,7 @@ impl App {
             term_height: 24,
             request_clear_screen: false,
             skip_drain_once: false,
+            todos: Vec::new(),
         };
         app.enqueue_notice(
             "rem — esc interrupt · ^D quit when empty · ^C clear · /quit quit · /new new session."
@@ -1743,8 +1760,11 @@ impl App {
 
     /// Print one finished tool row group straight to scrollback (live
     /// streaming, ADR-0005). `git_diff` output renders as a patch row with
-    /// `+N −M` counts + tinted bands; every other tool renders the flat
-    /// label + summary + elided-output rows. Reasoning is hidden entirely.
+    /// `+N −M` counts + tinted bands; `write`/`edit` carry their own unified
+    /// diff below the one-line summary, so they render the same patch row
+    /// and the raw summary line never shows twice. Every other tool renders
+    /// the flat label + summary + elided-output rows. Reasoning is hidden
+    /// entirely.
     fn stream_tool(&mut self, ev: &ToolEvent) {
         let w = self.term_width as usize;
         let rows = match ev.name.as_str() {
@@ -1752,6 +1772,24 @@ impl App {
                 let path = ev.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 history::patch_row("Diff", path, &ev.output, w, &self.theme)
             }
+            "write" | "edit" => match split_diff_body(&ev.output) {
+                Some((_summary, diff)) => {
+                    let path = ev.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    let verb = match ev.name.as_str() {
+                        "write" => "Wrote",
+                        _ => "Edited",
+                    };
+                    history::patch_row(verb, path, diff, w, &self.theme)
+                }
+                None => history::tool_row(
+                    &ev.name,
+                    &ev.arg_preview(),
+                    ev.ok,
+                    &ev.summary,
+                    &ev.output,
+                    w,
+                ),
+            },
             _ => history::tool_row(
                 &ev.name,
                 &ev.arg_preview(),
@@ -1840,17 +1878,39 @@ impl App {
                                 let parts: Vec<&str> =
                                     r.content.iter().filter_map(|c| c.as_text()).collect();
                                 let output = parts.join("\n");
-                                let summary: String = output
-                                    .lines()
-                                    .next()
-                                    .unwrap_or("")
-                                    .chars()
-                                    .take(120)
-                                    .collect();
                                 let w = self.term_width as usize;
-                                self.enqueue(crate::history::tool_row(
-                                    &r.name, "", true, &summary, &output, w,
-                                ));
+                                // Restored history carries no tool args, so the
+                                // path is unavailable: render the diff under a
+                                // verb-only header instead of the flat row.
+                                let is_file_edit = matches!(r.name.as_str(), "write" | "edit");
+                                let diff = is_file_edit.then(|| split_diff_body(&output)).flatten();
+                                match diff {
+                                    Some((_summary, body)) => {
+                                        let verb = match r.name.as_str() {
+                                            "write" => "Wrote",
+                                            _ => "Edited",
+                                        };
+                                        self.enqueue(crate::history::patch_row(
+                                            verb,
+                                            "",
+                                            body,
+                                            w,
+                                            &self.theme,
+                                        ));
+                                    }
+                                    None => {
+                                        let summary: String = output
+                                            .lines()
+                                            .next()
+                                            .unwrap_or("")
+                                            .chars()
+                                            .take(120)
+                                            .collect();
+                                        self.enqueue(crate::history::tool_row(
+                                            &r.name, "", true, &summary, &output, w,
+                                        ));
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -1908,6 +1968,13 @@ fn event_loop(
     // Seed transcript: welcome notice prints above the pane on first frame.
     app.dirty = true;
     loop {
+        // Pinned todo tree: refresh the snapshot every frame so the panel
+        // tracks `todowrite` calls live. `dirty` flips only on change.
+        let todos = agent.list_todos();
+        if todos != app.todos {
+            app.todos = todos;
+            app.dirty = true;
+        }
         // Drain live tool observations: each resolved tool streams its row
         // group straight to scrollback (ADR-0005). Gated on `busy`: a
         // ThinkMsg already in flight when the watcher aborts must not
@@ -2685,7 +2752,7 @@ fn submit(
                     msg.push_str(&format!("\n  /{}{usage} — {}", c.name, c.desc));
                 }
                 msg.push_str("\nfile refs: @file inlines content; @dir/ lists; @file:10-20 slices lines (also @file:42, @file:100-); multiple refs expand in order; a missing/unreadable/binary/outside-root ref blocks submit and names the bad ref");
-                msg.push_str("\nsubagents: todowrite owns the session task list (pass the full list each call: content + status pending/in_progress/completed); task spawns scoped subagent(s) — single description+prompt, or tasks[] fan-out (up to 8, 4 at a time, merged as ## sections), background:true detaches (summary on a later turn, /tasks shows status) — fresh context, no recursion, Esc aborts inline children with the turn");
+                msg.push_str("\nsubagents: todowrite owns the session task list (for medium-complex+ tasks state your understanding + plan first, then pass the full list each call: content + status pending/in_progress/completed); task spawns scoped subagent(s) — single description+prompt, or tasks[] fan-out (up to 8, 4 at a time, merged as ## sections), background:true detaches (summary on a later turn, /tasks shows status) — fresh context, no recursion, Esc aborts inline children with the turn");
                 app.enqueue_notice(msg);
                 return false;
             }
@@ -3317,10 +3384,16 @@ impl App {
             .min(self.max_visible_input_lines)
             .max(1)
     }
+    /// Pinned todo tree height: zero when the list is empty.
+    fn todo_pin_height(&self) -> u16 {
+        crate::history::todo_pin_height(self.todos.len())
+    }
 
     fn pane_height(&self, term_width: u16) -> u16 {
-        // Base chrome: gap(1) + status(1) + input band + footer(1).
-        PANE_ROWS.saturating_add(self.visible_input_lines(term_width).saturating_sub(1) as u16)
+        // Base chrome: gap(1) + status(1) + todo pin + input band + footer(1).
+        PANE_ROWS
+            .saturating_add(self.todo_pin_height())
+            .saturating_add(self.visible_input_lines(term_width).saturating_sub(1) as u16)
     }
 
     fn input_band_height(&self, term_width: u16, _menu_open: bool) -> u16 {
@@ -3603,11 +3676,13 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
         area.width,
         required,
     );
+    let todo_h = app.todo_pin_height();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),        // gap (terminal bg)
             Constraint::Length(status_h), // status (busy/idle)
+            Constraint::Length(todo_h),   // pinned todo tree (0 when empty)
             Constraint::Length(menu_h),   // docked slash/@ menu (0 when closed)
             Constraint::Length(input_h),  // ruled composer (bars + text)
             Constraint::Length(1),        // footer
@@ -3616,10 +3691,11 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
 
     render_gap(f, chunks[0]);
     render_status(f, app, chunks[1]);
-    render_menu_docked(f, app, chunks[2]);
+    render_todo_pin(f, app, chunks[2]);
+    render_menu_docked(f, app, chunks[3]);
     app.sync_input_scroll((area.width as usize).saturating_sub(4));
-    render_input(f, app, chunks[3]);
-    render_footer(f, app, chunks[4]);
+    render_input(f, app, chunks[4]);
+    render_footer(f, app, chunks[5]);
     // Picker float area: everything above the footer row of the full area.
     // Box bottom-anchors here (see popup::render_float), covering the
     // composer while open; footer stays visible below.
@@ -3635,8 +3711,18 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
     // the resized composer and input scroll, which the sessions-side
     // `cursor_x` single-line path did not.
     if app.session_picker.is_none() {
-        f.set_cursor_position(cursor_position(app, chunks[3]));
+        f.set_cursor_position(cursor_position(app, chunks[4]));
     }
+}
+/// Pinned todo tree at the top of the bottom pane: one accent `Todos`
+/// header plus one row per item, matching the reference tree shape.
+/// Empty renders nothing (zero-height chunk, no-op here too).
+fn render_todo_pin(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    if area.height == 0 || area.width == 0 || app.todos.is_empty() {
+        return;
+    }
+    let rows = crate::history::todo_pin_rows(&app.todos, area.width as usize, &app.theme);
+    f.render_widget(Paragraph::new(rows), area);
 }
 
 fn render_frame(f: &mut ratatui::Frame, app: &mut App) {
@@ -4498,6 +4584,35 @@ mod tests {
     }
 
     #[test]
+    fn pane_pins_todo_tree_above_composer() {
+        let mut app = App::new("test-model".to_string(), "medium".to_string());
+        app.term_width = 80;
+        app.todos = vec![
+            crate::tools::TodoItem {
+                content: "first".to_string(),
+                status: crate::tools::TodoStatus::Completed,
+            },
+            crate::tools::TodoItem {
+                content: "second".to_string(),
+                status: crate::tools::TodoStatus::Pending,
+            },
+        ];
+        assert_eq!(app.todo_pin_height(), 3);
+        assert_eq!(app.pane_height(80), 9);
+        let buf = pane_buffer(&mut app, 80);
+        // Pin sits directly below the status row, above the composer.
+        let head = cell_text(&buf, 2, 80);
+        assert!(head.contains("Todos · 1/2"), "pin header missing: {head}");
+        let first = cell_text(&buf, 3, 80);
+        assert!(first.contains("● first"), "pin row missing: {first}");
+        let second = cell_text(&buf, 4, 80);
+        assert!(second.contains("○ second"), "pin row missing: {second}");
+        // Footer still anchors the bottom.
+        let footer = cell_text(&buf, 8, 80);
+        assert!(footer.contains("▶ test-model"), "footer missing: {footer}");
+    }
+
+    #[test]
     fn composer_grows_and_shows_overflow_cues() {
         let mut app = App::new("model".to_string(), "medium".to_string());
         app.term_width = 40;
@@ -4718,6 +4833,82 @@ mod tests {
             .join("\n");
         assert!(flat.contains("+1"), "got: {flat}");
         assert!(flat.contains("−1"), "got: {flat}");
+    }
+
+    #[test]
+    fn split_diff_body_separates_summary_from_patch() {
+        let (summary, diff) =
+            split_diff_body("wrote f (6 bytes)\n--- a/f\n+++ b/f\n@@ x @@\n-a\n+b\n")
+                .expect("diff present");
+        assert_eq!(summary, "wrote f (6 bytes)");
+        assert!(diff.starts_with("--- a/f"), "got: {diff}");
+        // Summary-only or non-diff output keeps the flat row.
+        assert!(split_diff_body("wrote f (6 bytes)").is_none());
+        assert!(split_diff_body("failed: edit f: not found").is_none());
+    }
+
+    #[test]
+    fn write_streams_patch_row_with_verb_and_counts() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.term_width = 80;
+        let ev = crate::agent::ToolEvent {
+            name: "write".to_string(),
+            args: serde_json::json!({"path": "f.rs"}),
+            ok: true,
+            summary: "wrote f.rs".to_string(),
+            output:
+                "wrote f.rs (8 bytes)\n--- a/f.rs\n+++ b/f.rs\n@@ -1,2 +1,2 @@\n ctx\n- old\n+ new"
+                    .to_string(),
+        };
+        app.stream_tool(&ev);
+        let flat: String = app
+            .print_queue
+            .last()
+            .unwrap()
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flat.contains("Wrote"), "got: {flat}");
+        assert!(flat.contains("f.rs"), "got: {flat}");
+        assert!(flat.contains("+1"), "got: {flat}");
+        assert!(flat.contains("−1"), "got: {flat}");
+        // The raw one-line summary is the row header's job: never doubled.
+        assert!(!flat.contains("wrote f.rs ("), "got: {flat}");
+    }
+
+    #[test]
+    fn edit_without_diff_falls_back_to_flat_row() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.term_width = 80;
+        let ev = crate::agent::ToolEvent {
+            name: "edit".to_string(),
+            args: serde_json::json!({"path": "f.rs"}),
+            ok: false,
+            summary: "failed: edit f.rs: not found".to_string(),
+            output: "failed: edit f.rs: not found".to_string(),
+        };
+        app.stream_tool(&ev);
+        let flat: String = app
+            .print_queue
+            .last()
+            .unwrap()
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flat.contains("edit f.rs"), "got: {flat}");
+        assert!(flat.contains("failed:"), "got: {flat}");
     }
 
     #[test]
