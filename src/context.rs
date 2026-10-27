@@ -29,6 +29,9 @@ pub struct Checkpoint {
 impl Checkpoint {
     /// Snapshot the current messages plus the caller's `git diff` output.
     /// `messages_json` serializes the full history so restore replaces it verbatim.
+    /// Test-only helper: production captures through [`Context::record_turn`],
+    /// which receives the pre-turn strings from the agent loop.
+    #[cfg(test)]
     pub fn new_checkpoint(ctx: &Context, turn_idx: usize, git_diff: &str) -> Self {
         let messages_json = ctx.to_json().unwrap_or_default();
         Self {
@@ -120,6 +123,8 @@ impl Context {
 
     /// Zero-based count of completed turns. Snapshot `turn_idx` tags each
     /// checkpoint so `/rewind n` can address `turn - n`.
+    /// Test-only: the rewind/undo paths read `turn` inside this module.
+    #[cfg(test)]
     pub fn turn_idx(&self) -> usize {
         self.turn
     }
