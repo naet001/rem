@@ -1,192 +1,323 @@
 # rem
 
-A terminal coding agent built as a personal learning project. Rust + Ratatui TUI and a Rig agent loop. Every tool call runs immediately — no permission gates, no approval prompts.
+A terminal coding agent in Rust. Full-screen Ratatui TUI, a Rig agent loop with
+13 built-in tools, MCP servers, parallel subagents, and session persistence in
+SQLite. Every tool call executes immediately — no permission gates, no approval
+prompts, no modes.
 
-## Purpose
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/naet001/rem/dev.yml?branch=dev&label=CI)](https://github.com/naet001/rem/actions/workflows/dev.yml)
+[![Rust 2024](https://img.shields.io/badge/rust-2024-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 
-`rem` is a simple harness for learning how coding agents are put together. It is not production software: expect rough edges, and read the safety story below as a study, not a guarantee.
+## What it does
 
-The project works through a few questions end to end:
+- **Agent loop** — up to 100 model/tool steps per turn, streaming each resolved
+  tool call into the terminal's own scrollback.
+- **13 tools** — read, write, edit, bash, list, git status/diff, grep, glob,
+  web fetch, web search, todowrite, task.
+- **MCP client** — stdio and streamable-HTTP servers from one JSON file, with an
+  OAuth browser flow. Their tools register as `mcp__<server>__<tool>`.
+- **Parallel subagents** — fan out up to 8 scoped children, 4 running at a time,
+  or detach the whole call with `background: true` and get the summary on a
+  later turn.
+- **Turn rollback** — `/undo` and `/rewind <n>` restore both files and
+  conversation history from pre-turn checkpoints.
+- **Sessions** — one SQLite row per session, keyed by project; resume, rename,
+  and fork from a picker or the CLI.
+- **Skills** — Claude-compatible `SKILL.md` bundles with a startup index and
+  on-demand bodies.
+- **`@` file refs** — inline a file, a directory listing, or an exact line range
+  into the prompt.
+- **Headless** — `rem -p "..."` runs one turn and keeps stdout pipeable, with
+  `json` and `jsonl` output.
+- **Themes** — every color comes from a theme file; switch live with `/theme`.
+- **Two providers** — OpenAI-compatible endpoints and Anthropic, switchable
+  mid-session with a unified `/effort` knob.
 
-- How do you build a full-screen TUI — panes, popups, themes, keymaps — in Rust with Ratatui?
-- How do you run an agent loop (Rig) with tool calls, subagents, and session persistence?
-- How do sessions, skills, and config persist without any of it becoming privileged or magic?
+## Install
 
-## Design notes
+Requires Rust 1.85 or newer (edition 2024) and a C compiler. SQLite is compiled
+in through `rusqlite`'s `bundled` feature and TLS is rustls, so there is no
+system libsqlite or OpenSSL to install.
 
-The answers, as implemented:
+```bash
+cargo install --git https://github.com/naet001/rem
+```
 
-- **Tools run free** — every tool call executes immediately. No gates, no prompts, no modes.
-- **Reusable knowledge** — Claude-compatible `SKILL.md` bundles with startup index + on-demand bodies (ADR-0013).
-- **Decisions on record** — 19 ADRs in `docs/adr/`, `cargo test` green (minus 2 live web checks that need network).
+Or build from source:
 
-## Quickstart
+```bash
+git clone https://github.com/naet001/rem
+cd rem
+cargo build --release      # target/release/rem
+```
 
-Requires Rust + an OpenAI-compatible endpoint and/or an Anthropic key.
+CI attaches release binaries for `x86_64-unknown-linux-gnu` and
+`aarch64-apple-darwin` to each tagged release on
+[the releases page](https://github.com/naet001/rem/releases).
+
+Then point it at a model:
 
 ```bash
 mkdir -p ~/.config/rem
 cp config.example.toml ~/.config/rem/config.toml
-# edit ~/.config/rem/config.toml: set active_provider + [providers.*] entries;
-# export OPENAI_API_KEY / ANTHROPIC_API_KEY to match your key = "env:..." refs
-cargo run
+# edit ~/.config/rem/config.toml: set active_provider + [providers.*] entries
+export OPENAI_API_KEY="sk-..."       # match the env: reference in config
+rem
 ```
 
-Minimal `~/.config/rem/config.toml`:
+## Configure
+
+`~/.config/rem/config.toml` — one file, no search path, unknown keys rejected.
 
 ```toml
 active_provider = "openai"
-effort = "medium"  # low / medium / high (unified, mapped per provider)
+effort = "medium"                    # low / medium / high, mapped per provider
 
 [providers.openai]
 type = "openai-compatible"
 base_url = "https://api.openai.com/v1"
 key = "env:OPENAI_API_KEY"
 default_model = "gpt-4o"
+
+[providers.anthropic]
+type = "anthropic"
+key = "env:ANTHROPIC_API_KEY"
+default_model = "claude-sonnet-4-5"
 ```
 
-Add a `[providers.anthropic]` block (see `config.example.toml`) to use
-Claude too. Keys use `env:VAR` indirection only — literals are rejected.
-Switch live with `/model`, tune reasoning with `/effort`.
+Keys accept `env:VAR` indirection only — a literal secret is rejected, so a
+config is safe to paste into an issue. See
+[docs/configuration.md](docs/configuration.md) for every key, default, and error
+message.
 
-Talk, quit with `/quit`. On exit `rem` prints `Session saved. Resume with: rem --resume <id>`.
+Optional: MCP servers in `~/.config/rem/mcp.json`
+([docs/mcp.md](docs/mcp.md)).
+
+## Use it
+
+Type a request, `Enter` to send, `/quit` to exit. On the way out `rem` prints
+`Session saved. Resume with: rem --resume <id>`.
 
 ```
-rem --help       # usage, config + session pointers (no TUI, no config needed)
-rem --version    # print version and exit
-rem --resume <id>  # resume a saved session
+rem                        # TUI
+rem --resume <id>          # reopen a saved session
+rem --help                 # usage, config + session pointers, no TUI
+rem --version
 ```
 
-## Headless (`rem -p`)
+### Slash commands
 
-One turn, no TUI — stdout stays pipeable (diagnostics go to stderr):
-
-```bash
-rem -p "explain src/main.rs"          # print reply to stdout
-rem -p "summarize" --output json    # tools + result as one JSON doc
-rem -p "summarize" --output jsonl   # one JSON object per line
-echo "context..." | rem -p "use this"  # stdin (context) + -p (instruction)
-rem -p "continue" --resume <id>     # chain onto a saved session
-```
-
-Rules: `-p` only (no `exec` subcommand).
-`@path` refs and `/skill:name` invokes expand exactly like the TUI submit path.
-Sessions persist per turn; resume hint goes to stderr so stdout pipes cleanly.
-Exit codes: `0` turn ok, `1` turn/provider/save error, `2` CLI usage error.
-
-## Slash commands
-
-Full reference — type `/` for the floating menu, `Up`/`Down` to move, `Tab` to complete, `Enter` to run, `Esc` to dismiss:
+Type `/` for the floating menu — `Up`/`Down` to move, `Tab` to complete, `Enter`
+to run, `Esc` to dismiss. 17 registered commands, plus the `/skill:<name>`
+invocation form:
 
 | Command | Does |
 |---|---|
-| `/quit` | quit (same as `Ctrl+D` on empty input) |
-| `/new` | start a new session (saves current, resets context, clears screen) |
+| `/quit` | quit (also `Ctrl+D` on empty input) |
+| `/new` | new session: saves current, resets context, clears screen |
 | `/help` | list commands |
-| `/theme [name]` | list themes, or switch live (`/theme gruvbox` narrows, `Tab` completes, active marked `●`) |
 | `/init` | model inspects the repo and writes project-root `AGENTS.md` |
-| `/resume [id]` | bare `/resume` opens the session picker (this project, newest first); `/resume <id>` jumps straight there |
-| `/rename [name]` | rename current session |
-| `/fork` | clone current history into a new session id, title reset |
-| `/skills [reload]` | list discovered skills; `/skills reload` re-scans + rebuilds so new skills work without restart |
-| `/skill:<name> [task]` | invoke a skill: body expands into the turn, transcript shows the short form. Up to 6 leading mentions stack; `$ARGUMENTS` passes the task text |
-| `/model [[provider:]name]` | bare lists `provider:model` combos; `/model <name>` switches within the active provider, `/model <provider>:<name>` switches providers. History preserved, footer + session tag updated |
-| `/effort [low\|medium\|high]` | bare shows the session level; with a level applies live to the active provider (session-local, config file untouched) |
-| `/context` | local usage: message count (~chars), compaction trigger/keep window, summary status. No token API |
+| `/model [[provider:]name]` | bare lists `provider:model` combos; with a name switches live, history preserved |
+| `/effort [low\|medium\|high]` | show or set reasoning effort, session-local |
+| `/theme [name]` | list themes, or switch live and save the choice |
+| `/context` | message count, char estimate, compaction window, summary status |
+| `/resume [id]` | bare opens the picker for this project; `<id>` jumps straight there |
+| `/rename [name]` | rename the current session |
+| `/fork` | clone history into a new session id |
+| `/undo` | undo the last mutate turn — files and history |
+| `/rewind [n]` | restore to the checkpoint from `n` turns ago, without consuming it |
+| `/skills [reload]` | list discovered skills; `reload` re-scans without restart |
+| `/skill:<name> [task]` | expand a skill body into the turn |
+| `/mcp [on\|off\|login\|logout <name>]` | list, toggle, or authenticate MCP servers |
+| `/todos` | show the session todo list |
+| `/tasks [id]` | list background subagents, or show one summary |
 
-Keys: `Enter` submit, `Shift+Enter` or `Ctrl+O` newline, `Esc` interrupt a run (second `Esc` clears input), `Ctrl+C` clear, `j/k`, `Up/Down`, `Ctrl+d/u` in popups.
+Keys: `Enter` submit · `Shift+Enter` or `Ctrl+O` newline · `Esc` interrupt a run
+(a second `Esc` clears input) · `Ctrl+C` clear · `j/k`, `Up/Down`, `Ctrl+d/u` in
+popups.
 
-## File refs (`@` mentions)
+### Tools
 
-Point at project files from the composer — content is inlined into the model payload, transcript keeps the short form:
+Registered on one shared tool server; MCP tools join it at runtime, so a live
+session sees `13 + N` tools.
 
-- `@src/main.rs` inlines the file (capped at 2000 chars with a `[truncated N chars]` note)
-- `@src/` inlines a non-recursive `file:`/`dir:` listing (500 entries, same shape as `list_directory`)
-- `@src/main.rs:10-20` inlines lines 10–20 with line numbers; `@src/main.rs:42` one line; `@src/main.rs:100-` to end of file (end past EOF clamps)
-- Multiple refs expand in appearance order: `compare @a.rs:1-10 with @b.rs`
-- Bad refs block submit and name the ref: missing, unreadable, binary, outside-root (`../`, absolute, symlink escapes), invalid ranges (`20-10`, `0`, past-EOF start), range-on-directory
-- `@` completes via fuzzy popup (`Tab`/`Enter` accept, range suffix preserved, `Esc` dismisses); `/`-menu wins on slash lines
+| Group | Tools |
+|---|---|
+| **Files** | `read` · `write` · `edit` · `list_directory` |
+| **Shell + git** | `bash` · `git_status` · `git_diff` |
+| **Search** | `grep` (literal substring) · `glob` |
+| **Web** | `web_fetch` · `web_search` (DuckDuckGo, no key) |
+| **Orchestration** | `todowrite` · `task` |
 
-## Skills (compact)
+`write` and `edit` results carry a unified diff, rendered as a tinted patch with
+numbered red/green bands in the transcript.
 
-Claude-compatible `<name>/SKILL.md` bundles (YAML frontmatter `description` + Markdown body + sibling files). Identity is the folder name; malformed files load leniently (name-only + note) instead of breaking startup.
+### Subagents
 
-Discovery, first wins: `<project>/.agents/skills/` → `~/.config/rem/skills/` → `~/.agents/skills/`.
+`todowrite` owns the session task list — state your understanding and plan, then
+send the full list every call; each item is `content` plus `status` (`pending` /
+`in_progress` / `completed`). Trivial one-step tasks skip it.
 
-At startup the preamble gets an index (`name — description — path + siblings`); full bodies load on demand via `read`, scripts run via `bash`. No privileged runner, no new tool. See ADR-0013.
+`task` spawns scoped children and waits for the merged summary:
 
-## Sessions (compact)
-
-Persisted per turn in SQLite (`sessions.db` under your platform data dir), keyed by literal canonicalized cwd. One row: `id, project_root, title, model, messages_json`. The `model` column stores the `provider:model` tag.
-
-- `rem --resume <id>` restarts anywhere; unknown ids exit non-zero
-- `/resume` picker filters to the current project; `/fork` copies history verbatim
-- Resume restores the stored tag: `/resume <id>` and the picker switch the live client when it differs (unknown tags warn and keep the current client + history)
-- `/model` persists the new tag per switch; autosave keeps history + title — failures surface, never silent
-- Titles fall back to the first user message (40 chars); autosave is synchronous — failures surface, never silent
-
-## Themes (compact)
-
-Every color comes from the active theme — no hardcoded colors in the render path. Pointer lives top-level in config (`theme = "gruvbox"`), files live in `~/.config/rem/themes/<name>.toml`. Bundled themes ship in `themes/`.
-
-```bash
-/theme            # list installed + current
-/theme gruvbox    # load, apply live, save to config.toml byte-for-byte
-```
-
-Missing keys and bad hex fall back per-key to the built-in palette. See `docs/themes.md`.
-
-## Tools
-
-13 tools, wired through Rig's multi-step loop (up to 100 model/tool steps per turn):
-
-`read`, `write`, `edit`, `bash`, `list_directory`, `git_status`, `git_diff`, `grep`, `glob`, `web_fetch` (URL → text), `web_search` (DuckDuckGo, no key), `todowrite`, `task`.
-`write`/`edit` results carry a unified diff of the change, rendered as a tinted patch in the transcript (same bands as `git_diff`).
-
-### Subagents (serial, v1)
-
-`todowrite` owns the session task list. For medium-complex or larger tasks, first state your understanding of the task and your planned approach in the reply, then pass the full list every call; each item is `content` + `status` (`pending` / `in_progress` / `completed`). Trivial one-step tasks skip the list. Unknown fields (e.g. Claude-style `priority`) are accepted and ignored. `/todos` shows the list; `/new` clears it.
-
-```
-{"todos": [{"content": "write failing test", "status": "completed"}, {"content": "make it pass", "status": "in_progress"}]}
-```
-
-`task` spawns one scoped subagent and waits for its final summary:
-
-```
+```json
 {"description": "fix login retry", "prompt": "Fix the login retry bug in src/auth.rs. Read the file first, keep the change minimal, summarize what changed."}
 ```
 
-Caps and abort semantics: serial only (one child at a time); the child gets a fresh context plus your prompt under the identical preamble, the same tools minus `task` (depth-1, no recursion), the same 100-turn / 30s-bash budget. The parent transcript shows a single `task` row (summary only, capped at 4000 chars) — inner steps are never streamed. `Esc` aborts the child with the turn. Parallel fan-out and background `/tasks` are deferred.
+```json
+{"tasks": [{"description": "audit deps", "prompt": "..."}, {"description": "audit CI", "prompt": "..."}], "background": true}
+```
 
-Project context: project-root `AGENTS.md` only (no walk-up, no global), appended verbatim after the preamble under `Project context from AGENTS.md:`. Missing file = silently skipped. Survives compaction, takes effect on next restart. History compacts past 100 messages via one-shot summary (tools off, no recursion) — failures restore history instead of dropping it.
+Fan-out runs up to 8 children bounded-parallel (4 at a time) and merges them as
+`## <description>` sections in input order; one child failing does not sink the
+batch. `background: true` detaches and returns an id immediately — `/tasks`
+shows status and the summary arrives attached to a later turn.
 
-## Limits
+Children get fresh context plus the same tools minus `task` and minus MCP, under
+the same 100-step and 30-second budgets. `Esc` aborts foreground children with
+the turn; detached background work runs to completion.
 
-Explicit, because a learning project should not oversell:
+### Headless
 
-- **No sandbox.** Shell commands run with your user privileges. No namespaces, seccomp, or kernel boundary.
-- **No secrets redaction.** Reads return file bytes verbatim in v1.
-- **Local single-user.** No remote/multi-user support.
+One turn, no TUI. Diagnostics go to stderr so stdout stays pipeable:
 
-## Architecture & docs
+```bash
+rem -p "explain src/main.rs"                 # reply on stdout
+rem -p "summarize" --output json             # tools + result as one document
+rem -p "summarize" --output jsonl            # one JSON object per line
+echo "context..." | rem -p "use this"        # stdin context + instruction
+rem -p "continue" --resume <id>              # chain onto a saved session
+```
 
-- `docs/adr/` — historical design records (permissions ADRs 0001–0003, 0011 describe the removed gate)
-- `docs/glossary.md` — Principal / Skills, the living source of truth
-- `docs/themes.md`, `docs/popup-test-matrix.md`
+`@path` refs and `/skill:name` invokes expand exactly as they do in the TUI.
+Exit codes: `0` turn ok, `1` turn/provider/save error, `2` CLI usage error.
+Background tasks run inline here — there is no later turn to deliver to.
+
+### File refs
+
+Point at project files from the composer; content is inlined into the payload
+while the transcript keeps the short form.
+
+```
+@src/main.rs          file contents, capped at 2000 chars
+@src/                 non-recursive file:/dir: listing, 500 entries
+@src/main.rs:10-20    line range with line numbers (:42, :100- also work)
+```
+
+Multiple refs expand in appearance order. Bad refs block submit and name the
+ref: missing, unreadable, binary, outside-root (`../`, absolute, symlink
+escapes), invalid ranges (`20-10`, `0`, past-EOF start), or a range on a
+directory. `@` completes via fuzzy popup; `/` wins on slash lines.
+
+### Skills
+
+Claude-compatible `<name>/SKILL.md` bundles — YAML `description` frontmatter,
+Markdown body, sibling files. Identity is the folder name; malformed files load
+leniently instead of breaking startup.
+
+Discovery order, first wins: `<project>/.agents/skills/` →
+`~/.config/rem/skills/` → `~/.agents/skills/`. The preamble receives an index
+(name, description, path, siblings); full bodies load on demand through `read`
+and scripts through `bash`. No privileged runner, no extra tool
+([ADR-0013](docs/adr/0013-skills.md)).
+
+### Sessions
+
+Persisted per turn in SQLite — `sessions.db` under your platform data directory
+(`REM_SESSIONS_DB` overrides), keyed by the literal canonicalized working
+directory:
+
+```
+sessions(id, project_root, title, created_at, updated_at, model, messages_json)
+```
+
+`/resume` filters to the current project, `/fork` copies history verbatim, and
+the stored `provider:model` tag is restored on resume — an unknown tag warns and
+keeps the current client. Autosave is synchronous and failures surface rather
+than going silent. Titles fall back to the first user message at 40 characters.
+
+### Themes
+
+`theme = "nord"` at the top level, files in `~/.config/rem/themes/<name>.toml`.
+Ten ship in [`themes/`](themes): ashen, four catppuccin flavours, gruvbox dark
+and light, nord, and tokyo-night day and night.
+
+```bash
+/theme         # list installed + current
+/theme nord    # load, apply live, save to config.toml
+```
+
+Missing keys and malformed hex fall back per-key to the built-in palette. No
+hardcoded colors remain in the render path — see [docs/themes.md](docs/themes.md).
+
+### Context
+
+History compacts past 100 messages: everything older than the newest 40 is
+replaced by a one-shot summary from the same model with tools disabled. On
+summary failure the history is restored and the turn errors, rather than
+silently dropping your conversation. Project `AGENTS.md` is appended to the
+preamble verbatim and survives compaction.
+
+There is no token-counting API; `/context` reports local message count and
+character estimates.
+
+## Architecture
+
+```
+main.rs ── CLI, TUI entry
+  ├── agent.rs      Rig loop, preamble, checkpoints, compaction
+  │     └── tools/  13 built-ins + shared diff/error helpers
+  ├── mcp.rs        MCP client: stdio + HTTP, OAuth, dynamic registration
+  ├── tui.rs        ratatui frontend: commands, submit path, transcript
+  │     └── popup.rs, history.rs, markdown.rs, theme.rs
+  ├── context.rs    history, tool-result budget, undo checkpoints
+  ├── sessions.rs   SQLite persistence
+  ├── config.rs     providers, keys, effort
+  ├── skills.rs     SKILL.md discovery + index
+  └── headless.rs   -p single-turn mode
+```
+
+Design decisions are recorded as 21 dated ADRs in
+[`docs/adr/`](docs/adr). Note that the permission-gate series (ADR-0001, 0002,
+0003, 0011) describes a mechanism that was removed: tool calls are unconditional
+now, and the ADRs stay as the record of why. [`docs/glossary.md`](docs/glossary.md)
+is the source of truth for terminology.
+
+Further reading: [tools](docs/tools.md) ·
+[configuration](docs/configuration.md) · [MCP](docs/mcp.md) ·
+[themes](docs/themes.md) · [contributing](docs/contributing.md)
+
+## Limitations
+
+Stated plainly, because these matter before you point it at a repo you care
+about:
+
+- **No sandbox.** `bash` runs with your user privileges. No namespaces, seccomp,
+  or kernel boundary.
+- **No path confinement in the tools.** `read`, `write`, `edit`,
+  `list_directory`, and `bash` accept absolute paths and `..` traversal; only
+  `@` references typed into the composer are root-checked. There is no approval
+  step to catch a bad path.
+- **No secrets redaction.** Reads return file bytes verbatim.
+- **No token accounting.** Context usage is a local character estimate.
+- **Local, single-user.** No remote or multi-user support.
+- **Subagent summaries are lossy** — capped at 4000 characters, inner steps
+  never streamed.
 
 ## Development
 
 ```bash
-cargo test            # offline-green: skills, TUI regressions, agent loop (live web checks ignored)
-cargo test -- --ignored  # opt-in: 2 live web checks (need network)
-cargo fmt --check
+cargo test                 # offline-green (2 live web checks ignored)
+cargo test -- --ignored    # opt-in: needs network
+cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-Tests live next to code (`skills.rs`, `tui.rs`, `agent.rs`, `config.rs`, …).
+~320 tests live next to the code they cover. Pushes to `dev` run all three, then
+wait for an explicit approval before promoting to `main` and cutting a release —
+see [docs/contributing.md](docs/contributing.md).
 
 ## License
 
-MIT — see `LICENSE`.
-
+MIT — see [LICENSE](LICENSE).
