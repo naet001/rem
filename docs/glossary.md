@@ -83,5 +83,5 @@
 - **Display-vs-send**: Transcript user row, input history, and title fallback keep the short original with `@` tokens; only the model payload appends `path:\n```\ncontents\n``` ` (files), `path:START-END:\n```\nN: line\n``` ` (ranges), or `dir/ (directory listing):\nfile:/dir: lines` (dirs) blocks. Sessions store the expanded prompt.
 - **@ caps**: Per-file `TOOL_BUDGET` (2000 chars, slices included) with ` [truncated N chars]`; dirs non-recursive, sorted, `file:`/`dir:` lines, 500 entries (`list_directory` parity). Ranges: `END` past EOF clamps.
 - **@ block**: Submit is blocked with a notice naming the bad ref when a ref is missing, unreadable, binary, outside the project root, or an invalid range (`END` before `START`, `0`, `START` past EOF, range on a directory). Large refs truncate, never block.
-- **@ confinement**: Every ref resolves against the process cwd; absolute paths and `../`/symlink escapes are blocked.
+- **@ confinement**: Every ref resolves against the project root. The check is lexical (`at_resolve_in_root`): absolute paths and `../` escapes are blocked, but symlinks are never resolved, so a link inside the project pointing outside it is followed.
 - **@ reads**: `@` only adds prompt context, never writes or executes.

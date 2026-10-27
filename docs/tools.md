@@ -200,8 +200,11 @@ No file tool confines paths to the project root. `read`, `write`, `edit`,
 `list_directory`, and `bash` accept absolute paths and `..` traversal, and child
 processes inherit the process working directory. Root confinement exists only
 for `@` file references typed into the composer
-(`at_resolve_in_root`, `src/tui.rs:1003`) — see the README section on file refs.
-This is deliberate; read [the limitations](../README.md#limitations).
+(`at_resolve_in_root`, `src/tui.rs:1003`) — and that check is **lexical**: it
+normalizes `..` components away and rejects absolute paths, but never calls
+`canonicalize`, so a symlink inside the project that points outside the tree is
+still followed. This is deliberate; read
+[the limitations](../README.md#safety-model-and-limitations).
 
 ## See also
 

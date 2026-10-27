@@ -997,9 +997,10 @@ fn active_at_token(input: &str, caret: usize) -> Option<(usize, usize, String)> 
 }
 
 /// Resolve a raw `@` token path against `project_root`. Returns `Some(full)
-/// on success, `None` on outside-root / absolute / symlink escape.
-/// Lexical normalization only (no fs access) — canonical check happens at
-/// read time.
+/// on success, `None` on absolute paths or `..` segments that escape the root.
+/// Lexical normalization only (no fs access): a symlink inside the project that
+/// points outside the root is NOT detected here and will be followed at read
+/// time. See README "Safety model and limitations".
 fn at_resolve_in_root(project_root: &std::path::Path, raw: &str) -> Option<std::path::PathBuf> {
     use std::path::{Component, PathBuf};
     if raw.is_empty() {

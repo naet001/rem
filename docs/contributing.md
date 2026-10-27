@@ -78,6 +78,8 @@ identifier.
 
 ## Branch flow and releases
 
+The intended flow, as encoded in the two workflow files:
+
 ```
 feature work → dev ──tests pass──▶ promote (needs approval) ──▶ main ──▶ tag v*.*.* ──▶ GitHub Release
 ```
@@ -100,6 +102,10 @@ managed by CI on `main` — do not hand-bump it in a `dev` PR.
 The approval gate is one-time setup on the repo:
 **Settings → Environments → New environment → `production` → Required reviewers →
 add yourself.** Without it the promote job runs unattended.
+
+Not yet exercised: `origin` currently holds only `dev`, with no `main` branch and
+no tags, so the promote and release halves of this pipeline are untested. The
+first promotion should be watched closely.
 
 ## Conventions
 
